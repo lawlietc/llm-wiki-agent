@@ -1,0 +1,12 @@
+node_modules/
+coverage/
+dist/
+*.tmp
+.DS_Store
+
+# npm 本地缓存（绕开沙箱对全局缓存目录的写限制时生成）
+.npm-cache/
+
+# 安装过程日志
+install.log
+npm-install.log
