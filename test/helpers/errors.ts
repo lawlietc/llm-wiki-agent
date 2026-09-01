@@ -35,3 +35,8 @@ export function errorCodeOf(fn: () => unknown): string | null {
 export function expectErrorCode(fn: () => unknown, code: string): void {
   expect(errorCodeOf(fn)).toBe(code);
 }
+
+/** 断言 Promise 以指定 code 拒绝 —— 同步版 expectErrorCode 接不住 async 函数 */
+export async function expectErrorCodeAsync(promise: Promise<unknown>, code: string): Promise<void> {
+  await expect(promise).rejects.toMatchObject({ code });
+}
