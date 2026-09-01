@@ -18,7 +18,9 @@
     "@ai-sdk/google": "^3.0.120",
     "@ai-sdk/openai": "^3.0.106",
     "@ai-sdk/openai-compatible": "^2.0.74",
-    "ai": "^6.0.273"
+    "@mozilla/readability": "^0.6.0",
+    "ai": "^6.0.273",
+    "linkedom": "^0.18.13"
   },
   "devDependencies": {
     "@types/node": "^22.13.0",
