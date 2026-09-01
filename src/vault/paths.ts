@@ -6,7 +6,7 @@
  * `_assert_portable_write_path` 移植。
  */
 
-import { lstatSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import type { Stats } from 'node:fs';
 
@@ -122,11 +122,29 @@ export function assertPortableWritePath(value: string): void {
 /**
  * 解析后的真实路径必须仍在 vault 内。
  *
+ * 候选可能尚不存在（新建文件）：此时沿路径向上取「最深的已存在祖先」做 realpath
+ * 比对 —— 只要该祖先在 vault 内，其下即将创建的文件就不可能逃逸（F1.5 写新文件依赖此行为）。
  * 用 `realRoot + path.sep` 而非裸前缀比较，避免 `/vault2` 被当成 `/vault` 的子路径。
  */
 export function assertWithin(root: string, candidate: string, allowRoot = false): void {
-  const real = realpathSync(candidate);
   const realRoot = realpathSync(root);
+
+  let probe = path.resolve(candidate);
+  const seen = new Set<string>();
+  while (!existsSync(probe) && !seen.has(probe)) {
+    seen.add(probe);
+    const parent = path.dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+
+  let real: string;
+  try {
+    real = realpathSync(probe);
+  } catch {
+    real = probe;
+  }
+
   if (!real.startsWith(realRoot + path.sep) && !(allowRoot && real === realRoot)) {
     throw new SafetyError('PATH_OUTSIDE_VAULT', `路径越界：${candidate} 不在 ${root} 内`);
   }
