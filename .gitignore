@@ -10,3 +10,4 @@ dist/
 # 安装过程日志
 install.log
 npm-install.log
+m3-test.log

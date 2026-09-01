@@ -19,6 +19,14 @@ export default defineConfig({
     // 用 forks 而非 threads：vault 模块大量使用 process.cwd()/process.pid 与真实文件锁，
     // worker_threads 下 process 级状态是共享的，会互相污染。
     pool: 'forks',
+    // M3 引入 ai/@ai-sdk 等重模块：关闭文件并行 + 单 fork 复用，避免多 worker 各加载
+    // 一份重模块叠加顶到 heap 上限（曾 OOM）。模块级状态由各文件 beforeEach 复位，隔离无碍。
+    fileParallelism: false,
+    poolOptions: {
+      forks: {
+        singleFork: true,
+      },
+    },
     testTimeout: 20_000,
     hookTimeout: 20_000,
     coverage: {
