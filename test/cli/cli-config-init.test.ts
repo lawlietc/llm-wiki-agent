@@ -115,6 +115,8 @@ describe('F6.1 init 命令', () => {
       // 默认配置是合法可加载的（含 chat_model/embedding_model + env: 引用）
       const written = JSON.parse(readFileSync(res.configPath, 'utf8'));
       expect(written.chat_model).toBe(DEFAULT_CONFIG.chat_model);
+      // M8 F8.3：默认带 ACP 开关且关闭（不破坏既有默认）
+      expect(written.reasoning?.agent?.enabled).toBe(false);
 
       // 重复 init → fail-closed 报错
       let err: unknown;

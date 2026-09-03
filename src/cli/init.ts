@@ -23,6 +23,10 @@ export const DEFAULT_CONFIG = {
     anthropic: { apiKey: 'env:ANTHROPIC_API_KEY' },
     openai: { apiKey: 'env:OPENAI_API_KEY' },
   },
+  // ACP 本地 agent 腿开关（M8）：默认关闭，开启后配 provider/command/args 即可走本地 agent
+  reasoning: {
+    agent: { enabled: false },
+  },
 };
 
 const SCAFFOLD_DIRS = ['raw', 'wiki', '.index', '.vault-meta'];
