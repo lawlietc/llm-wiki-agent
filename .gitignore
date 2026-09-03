@@ -2,6 +2,7 @@ node_modules/
 coverage/
 dist/
 *.tmp
+.tmp-wiki-cli.mjs
 .DS_Store
 
 # npm 本地缓存（绕开沙箱对全局缓存目录的写限制时生成）
