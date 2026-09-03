@@ -30,7 +30,7 @@ export const ACP_REGISTRY: ACPProvider[] = [
   { id: 'kiro', command: 'kiro', args: ['--agent-protocol'] }, // 未验证
   { id: 'trae', command: 'trae', args: ['acp'] }, // 未验证
   { id: 'grok', command: 'grok', args: ['--acp'] }, // 未验证
-  { id: 'opencode', command: 'opencode', args: ['--acp'] }, // 未验证
+  { id: 'opencode', command: 'opencode', args: ['acp'] }, // 实测 1.18.23：ACP 是子命令 `opencode acp`（非 --acp，F9.4）
   { id: 'copilot', command: 'copilot', args: ['acp'] }, // 未验证
   { id: 'dsh', command: 'dsh', args: ['--acp'] }, // 未验证
   { id: 'gemini', command: 'gemini', args: ['--acp'] }, // 未验证（实为 --experimental-acp）
