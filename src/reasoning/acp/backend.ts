@@ -20,6 +20,8 @@ import { initializeTransport, spawnTransport, type SpawnedAgent } from './transp
 export interface ACPAgentBackendOptions {
   /** initialize 握手超时 ms（默认 30_000） */
   initializeTimeoutMs?: number;
+  /** session/new 的 cwd（默认 process.cwd()） */
+  cwd?: string;
   /** 畸形行 / 警告回调（默认静默） */
   onWarn?: (msg: string) => void;
 }
@@ -65,7 +67,11 @@ export class ACPAgentBackend implements ReasoningBackend {
     const t = await this.connect();
     if (this.sessionId) return t;
     try {
-      const s = await t.connection.request<{ sessionId: string }>('session/new', {});
+      // 真实 ACP（opencode）要求 session/new 带 cwd + mcpServers，否则 Invalid params（F9.2）
+      const s = await t.connection.request<{ sessionId: string }>('session/new', {
+        cwd: this.opts.cwd ?? process.cwd(),
+        mcpServers: {},
+      });
       this.sessionId = s.sessionId;
       return t;
     } catch (e) {
@@ -82,18 +88,25 @@ export class ACPAgentBackend implements ReasoningBackend {
       );
     }
     const t = await this.ensureSession();
-    const prompt = req.prompt ?? lastUserMessage(req.messages);
+    // ACP 的 session/prompt 无 system 字段：把 system（6 条硬规则 + JSON 格式要求）并入 prompt，
+    // 并改发 ContentBlock[]（真实 ACP 要求，opencode 实测）。（F9.2）
+    const prompt = buildPrompt(req);
     let res: { content?: string; usage?: { inputTokens?: number; outputTokens?: number } };
     try {
       res = await t.connection.request<{
         content?: string;
         usage?: { inputTokens?: number; outputTokens?: number };
-      }>('session/prompt', { sessionId: this.sessionId, prompt });
+      }>('session/prompt', {
+        sessionId: this.sessionId,
+        prompt: [{ type: 'text', text: prompt }],
+      });
     } catch (e) {
       throw toACPRequestError(e);
     }
     const usage = res.usage ?? { inputTokens: 0, outputTokens: 0 };
-    const text = res.content ?? '';
+    // 真实 ACP（opencode）正文经无 id 的 session/update 通知推送，response.content 可能为空；
+    // 优先取通知累积正文，回退 response.content（F9.1/F9.2）。
+    const text = (t.connection.takeStreamedText() || res.content || '').trim();
     return {
       text,
       blocks: text ? [{ type: 'text', text }] : [],
@@ -150,4 +163,15 @@ function lastUserMessage(messages?: ChatMessage[]): string {
     }
   }
   return '';
+}
+
+/**
+ * 构造发给 ACP 的 prompt 文本。
+ * ACP 的 `session/prompt` 没有 system 字段（真实 ACP 把 system 放进 session 配置或首条内容块），
+ * 而 synthesize 的 6 条硬规则 + JSON 格式要求全在 system 里 —— 必须并入 prompt，否则被静默丢弃（F9.2）。
+ */
+function buildPrompt(req: ReasoningRequest): string {
+  const user = req.prompt ?? lastUserMessage(req.messages);
+  if (!req.system) return user;
+  return `${req.system}\n\n---\n\n${user}`;
 }
