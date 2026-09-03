@@ -35,7 +35,7 @@ export async function runStatus(
   }
 
   const dirty = existsSync(path.join(deps.vaultRoot, DIRTY_MARKER_REL));
-  const providers = Object.keys(deps.config.gateway.providers);
+  const providers = deps.config.gateway ? Object.keys(deps.config.gateway.providers) : [];
 
   const info: StatusInfo = {
     root: deps.vaultRoot,
