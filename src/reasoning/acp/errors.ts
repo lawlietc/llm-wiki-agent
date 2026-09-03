@@ -15,6 +15,9 @@ import { ConfigError, TransientError } from '../../errors';
 
 /** 把未知错误归一化为 ConfigError / TransientError */
 export function toACPRequestError(err: unknown): Error {
+  // 已是归一化错误 → 原样保留（含 code，F9.3 早期退出产生的 TransientError 不被二次包裹）
+  if (err instanceof TransientError || err instanceof ConfigError) return err as Error;
+
   const e = err as { code?: string; message?: string } | null;
   const msg = String(e?.message ?? err);
 

@@ -40,6 +40,9 @@ const {
   ignoreTerm = false,
   promptText = null,
   omitUsage = false,
+  notifyChunks = null,
+  thoughtChunks = null,
+  omitContent = false,
 } = scenario;
 
 if (ignoreTerm) {
@@ -58,6 +61,7 @@ if (env.ACP_STARTED_FILE) {
 
 const echoFile = env.ACP_ECHO_INIT_FILE;
 let sessionSeq = 0;
+let currentSessionId = '';
 let buf = '';
 
 function send(obj) {
@@ -128,22 +132,73 @@ async function handle(msg) {
   }
 
   if (msg.method === 'session/new') {
+    // 回显 cwd/mcpServers 供 F9.2 断言真实 ACP 形态
+    if (env.ACP_SESSION_NEW_ECHO_FILE) {
+      try {
+        writeFileSync(env.ACP_SESSION_NEW_ECHO_FILE, JSON.stringify(msg.params ?? {}));
+      } catch {
+        /* 非致命 */
+      }
+    }
     sessionSeq += 1;
-    send({ jsonrpc: '2.0', id, result: { sessionId: `sess-${sessionSeq}` } });
+    currentSessionId = `sess-${sessionSeq}`;
+    send({ jsonrpc: '2.0', id, result: { sessionId: currentSessionId } });
     return;
   }
 
   if (msg.method === 'session/prompt') {
+    // 回显 prompt 形状（ContentBlock[]）供 F9.2 断言
+    if (env.ACP_PROMPT_ECHO_FILE) {
+      try {
+        writeFileSync(env.ACP_PROMPT_ECHO_FILE, JSON.stringify(msg.params?.prompt ?? null));
+      } catch {
+        /* 非致命 */
+      }
+    }
     if (sessionError) {
       send({ jsonrpc: '2.0', id, error: { code: -32001, message: sessionError } });
       return;
     }
-    const text = promptText != null ? promptText : `PONG:${msg.params?.prompt ?? ''}`;
-    if (omitUsage) {
-      send({ jsonrpc: '2.0', id, result: { content: text } }); // 缺省 usage → 触发后端 ?? 0 分支
-    } else {
-      send({ jsonrpc: '2.0', id, result: { content: text, usage } });
+    const rawPrompt = msg.params?.prompt;
+    // 真实 ACP（F9.2）：prompt 是 ContentBlock[] [{type:'text',text}]；兼容旧字符串形态
+    const promptStr = Array.isArray(rawPrompt)
+      ? rawPrompt.map((b) => (b && b.type === 'text' ? b.text : '')).join('')
+      : typeof rawPrompt === 'string'
+        ? rawPrompt
+        : '';
+    const text = promptText != null ? promptText : `PONG:${promptStr}`;
+
+    // 真实 ACP 形态（opencode 1.18.23 实测）：正文经**无 id** 的 session/update 通知推送，
+    // 响应体只有 { stopReason, usage }。agent_thought_chunk 是思考过程，必须与正文区分。
+    if (thoughtChunks) {
+      for (const t of thoughtChunks) {
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: currentSessionId,
+            update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: t } },
+          },
+        });
+      }
     }
+    if (notifyChunks) {
+      for (const t of notifyChunks) {
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: currentSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: t } },
+          },
+        });
+      }
+    }
+
+    const result = { stopReason: 'end' };
+    if (!omitContent) result.content = text;
+    if (!omitUsage) result.usage = usage;
+    send({ jsonrpc: '2.0', id, result });
     return;
   }
 

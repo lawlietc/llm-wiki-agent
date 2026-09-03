@@ -13,7 +13,7 @@
  * - `terminate`：SIGTERM 优雅 + 超时 SIGKILL（I5）
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { type Readable } from 'node:stream';
 
 import { TransientError } from '../../errors';
@@ -40,6 +40,20 @@ type Pending = {
   resolve: (v: unknown) => void;
   reject: (e: unknown) => void;
   timer?: ReturnType<typeof setTimeout>;
+};
+
+/** 客户端能收到的服务端消息：请求响应（有 id）或通知（有 method 无 id） */
+type AcpServerMessage = {
+  id?: number;
+  method?: string;
+  result?: unknown;
+  error?: { message?: string };
+  params?: {
+    update?: {
+      sessionUpdate?: string;
+      content?: { type?: string; text?: string };
+    };
+  };
 };
 
 function assertChildWithPipes(child: ChildProcess): boolean {
@@ -78,7 +92,12 @@ export class AcpConnection {
   private stderrChunks: string[] = [];
   private closing = false;
   private exited = false;
+  /** 已收到任意响应（区分「spawn 即失败」与「连接后中途死亡」，F9.3） */
+  private gotAnyResponse = false;
+  /** session/update 通知累积的正文（真实 ACP 如 opencode 经此推送，F9.1） */
+  private streamedText = '';
   spawnError: Promise<never>;
+  private rejectSpawnError: (e: Error) => void = () => {};
   private stream?: AsyncIterableIterator<unknown>;
 
   constructor(
@@ -94,14 +113,24 @@ export class AcpConnection {
     }
     child.stderr!.on('data', (c: Buffer) => this.stderrChunks.push(c.toString()));
     this.spawnError = new Promise<never>((_, rej) => {
+      this.rejectSpawnError = rej;
       child.once('error', (e: Error) => {
         this.exited = true;
-        rej(new Error(`${e}\n${this.stderrChunks.join('')}`));
+        rej(new TransientError('ACP_SPAWN_FAILED', `${e}\n${this.stderrChunks.join('')}`));
       });
     });
     child.on('exit', (code, sig) => {
       this.exited = true;
-      if (!this.closing) this.failAll(new Error(`ACP 子进程提前退出 code=${code} signal=${sig}`));
+      if (!this.closing) {
+        if (!this.gotAnyResponse) {
+          // 任何响应前即退出 → 视为启动失败（F9.3：Windows 下 shell 找不到命令是 exit 而非 error 事件）
+          this.rejectSpawnError(
+            new TransientError('ACP_SPAWN_FAILED', `ACP 子进程启动即退出 code=${code} signal=${sig}`),
+          );
+        } else {
+          this.failAll(new Error(`ACP 子进程提前退出 code=${code} signal=${sig}`));
+        }
+      }
     });
     this.stream = createLoggedNdJsonStream(child.stdout!, onWarn);
     void this.pump();
@@ -111,20 +140,53 @@ export class AcpConnection {
     if (!this.stream) return;
     try {
       for await (const msg of this.stream) {
-        this.dispatch(msg as { id?: number; result?: unknown; error?: { message?: string } });
+        this.dispatch(msg as AcpServerMessage);
       }
     } catch (e) {
       if (!this.closing) this.failAll(e as Error);
     }
   }
 
-  private dispatch(msg: { id?: number; result?: unknown; error?: { message?: string } }): void {
-    if (typeof msg.id !== 'number') return; // 通知（无 id）忽略
+  /**
+   * 服务端消息分发：
+   * - 通知（有 method 且无 id）：真实 ACP 经 session/update 推送正文/思考，须消费（F9.1）
+   * - 请求响应（有 id）：按 id 关联
+   * - 其它（无 id 无 method）：忽略
+   */
+  private dispatch(msg: AcpServerMessage): void {
+    if (msg.method && msg.id === undefined) {
+      this.handleNotification(msg);
+      return;
+    }
+    if (typeof msg.id !== 'number') return;
+    this.gotAnyResponse = true;
     const p = this.pending.get(msg.id);
     if (!p) return;
     this.pending.delete(msg.id);
     if (msg.error) p.reject(new Error(`ACP 错误响应: ${msg.error.message ?? JSON.stringify(msg.error)}`));
     else p.resolve(msg.result);
+  }
+
+  /** 消费 session/update 通知：累积 agent_message_chunk 正文，排除 agent_thought_chunk（F9.1） */
+  private handleNotification(msg: AcpServerMessage): void {
+    if (msg.method !== 'session/update') return;
+    const upd = msg.params?.update;
+    if (!upd || upd.sessionUpdate !== 'agent_message_chunk') return;
+    const content = upd.content;
+    if (content && content.type === 'text' && typeof content.text === 'string') {
+      this.streamedText += content.text;
+    }
+  }
+
+  /**
+   * 取走累积的通知正文（取后清空）。
+   * 真实 ACP（opencode）的回答经无 id 的 session/update 推送，response 体无 content；
+   * 纯补全器后端在 prompt 响应后调用此方法拿正文，取不到时回退 response.content（F9.2）。
+   */
+  takeStreamedText(): string {
+    const t = this.streamedText;
+    this.streamedText = '';
+    return t;
   }
 
   private failAll(e: Error): void {
@@ -163,7 +225,7 @@ export class AcpConnection {
     this.child.stdin.write(JSON.stringify(obj) + '\n');
   }
 
-  /** 关闭子进程：SIGTERM 优雅 + 超时 SIGKILL 强杀（I5） */
+  /** 关闭子进程：SIGTERM 优雅 + 超时强杀（I5） */
   async terminate(timeoutMs = 2_000): Promise<void> {
     this.closing = true;
     const child = this.child;
@@ -174,11 +236,29 @@ export class AcpConnection {
     await Promise.race([exited, grace]);
     if (child.exitCode == null) {
       // 优雅窗口内未退出 → 强杀（I5 超时强杀路径）
-      child.kill('SIGKILL');
+      if (process.platform === 'win32') {
+        // Windows 下 SIGKILL 对部分子进程无效（实测 opencode 残留孤儿），用 taskkill 杀整棵进程树
+        try {
+          spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+        } catch {
+          /* 忽略 */
+        }
+      } else {
+        child.kill('SIGKILL');
+      }
       const force = new Promise<void>((res) => setTimeout(res, timeoutMs));
       await Promise.race([exited, force]);
     }
   }
+}
+
+/** Windows：裸命令（npm 全局 CLI 的 shim，无 .exe 扩展）需经 shell 解析；
+ * 绝对路径带扩展名（如 .../opencode.exe、node.exe）可直接 spawn。
+ * 非 Windows 一律不启用 shell（POSIX 下 shim 可直接 exec）。 */
+function shouldUseShell(command: string): boolean {
+  if (process.platform !== 'win32') return false;
+  const base = command.replace(/^.*[\\/]/, '');
+  return !/\.[a-z0-9]+$/i.test(base);
 }
 
 /** 拉起 agent 子进程并建立连接 */
@@ -188,7 +268,9 @@ export function spawnTransport(
   env: Record<string, string>,
   onWarn: (msg: string) => void = () => {},
 ): SpawnedAgent {
-  const child = spawn(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const opts: SpawnOptions = { env, stdio: ['pipe', 'pipe', 'pipe'] };
+  if (shouldUseShell(command)) opts.shell = true; // F9.3：Windows 裸命令经 shell 解析 .cmd shim
+  const child = spawn(command, args, opts);
   const connection = new AcpConnection(child, onWarn);
   return { child, connection };
 }
