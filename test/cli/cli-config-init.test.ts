@@ -37,9 +37,10 @@ describe('F6.1 config 加载', () => {
     await v.write(CONFIG_FILE, JSON.stringify(cfg));
 
     const loaded = loadConfig(v.root, {});
-    expect(loaded.gateway.chat_model).toBe('anthropic:claude-x');
-    expect(loaded.gateway.embedding_model).toBe('openai:emb');
-    expect(loaded.gateway.providers.anthropic.apiKey).toBe('sk-direct');
+    expect(loaded.gateway).toBeDefined();
+    expect(loaded.gateway!.chat_model).toBe('anthropic:claude-x');
+    expect(loaded.gateway!.embedding_model).toBe('openai:emb');
+    expect(loaded.gateway!.providers.anthropic.apiKey).toBe('sk-direct');
   });
 
   it('T6.1-02 "env:VAR" 解析为环境变量值；缺失抛 ConfigError 且只暴露变量名、不含密钥值（I2）', async () => {
@@ -62,7 +63,8 @@ describe('F6.1 config 加载', () => {
 
     // 存在 → 解析为值，不抛错（值仅在内存，不进任何消息）
     const loaded = loadConfig(v.root, { MY_KEY: 's3cr3t' });
-    expect(loaded.gateway.providers.anthropic.apiKey).toBe('s3cr3t');
+    expect(loaded.gateway).toBeDefined();
+    expect(loaded.gateway!.providers.anthropic.apiKey).toBe('s3cr3t');
   });
 
   it('T6.1-03 配置文件缺失 → ConfigError CONFIG_READ_FAILED', async () => {

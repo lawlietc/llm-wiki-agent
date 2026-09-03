@@ -35,7 +35,8 @@ export interface ACPAgentConfig {
 }
 
 export interface ReasoningRouterDeps {
-  gatewayConfig: AIGatewayConfig;
+  /** 网关配置（仅网关腿使用）；ACP-only 模式下可省略（T7.5-05 ACP 独立可用） */
+  gatewayConfig?: AIGatewayConfig;
   acpConfig?: ACPAgentConfig;
 }
 

@@ -9,12 +9,12 @@
  * 本文件不读 stdin。
  */
 
-import { GatewayBackend } from '../reasoning/gateway-backend';
-import { configureGateway, type AIGatewayConfig } from '../reasoning/gateway-config';
+import { configureGateway } from '../reasoning/gateway-config';
 import type { ReasoningBackend } from '../reasoning/backend';
+import { resolveReasoningBackend, type ACPAgentConfig } from '../reasoning/acp/router';
 import { createVault, type Vault } from '../vault/vault';
 import { resolveVaultRoot } from '../vault/resolve-root';
-import { loadConfig } from './config';
+import { loadConfig, type LoadedConfig } from './config';
 import type { CliIO } from './io';
 import { runInit } from './init';
 import { runIngest } from './ingest';
@@ -61,9 +61,37 @@ function parseArgs(args: string[]): ParsedArgs {
   return { positionals, flags };
 }
 
-function buildGateway(config: AIGatewayConfig): ReasoningBackend {
-  configureGateway(config);
-  return new GatewayBackend();
+/**
+ * 按配置 + CLI 标志构建推理后端（M8 F8.2）。
+ * - `--agent <id>` → 强制走 ACP 腿（acp:<id>），provider 取标志值并继承配置里的 command/args/env 覆盖
+ * - 否则若配置 reasoning.agent.routeDefault → 默认也走 ACP
+ * - 否则走网关腿（GatewayBackend）
+ * ACP 腿不读网关配置；网关不可用时 ACP 仍独立可用（T7.5-05）。
+ */
+function buildReasoningBackend(
+  config: LoadedConfig,
+  flags: Record<string, string | boolean>,
+): ReasoningBackend {
+  if (config.gateway) configureGateway(config.gateway);
+  const baseAcp = config.acp;
+  let acpConfig: ACPAgentConfig | undefined;
+  let model: string | undefined;
+  if (typeof flags.agent === 'string' && flags.agent.trim() !== '') {
+    const provider = flags.agent.trim();
+    acpConfig = {
+      enabled: true,
+      provider,
+      ...(baseAcp?.command !== undefined ? { command: baseAcp.command } : {}),
+      ...(baseAcp?.args !== undefined ? { args: baseAcp.args } : {}),
+      ...(baseAcp?.env !== undefined ? { env: baseAcp.env } : {}),
+      ...(baseAcp?.initializeTimeoutMs !== undefined ? { initializeTimeoutMs: baseAcp.initializeTimeoutMs } : {}),
+    };
+    model = `acp:${provider}`;
+  } else {
+    acpConfig = baseAcp;
+    if (baseAcp?.routeDefault) model = `acp:${baseAcp.provider ?? 'cursor'}`;
+  }
+  return resolveReasoningBackend(model, { gatewayConfig: config.gateway, acpConfig });
 }
 
 function reportError(e: unknown, io: CliIO): void {
@@ -102,39 +130,54 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
       case 'ingest': {
         const input = positionals[0];
         if (!input) {
-          io.err('用法：wiki ingest <path|url> [--yes]');
+          io.err('用法：wiki ingest <path|url> [--yes] [--agent <id>]');
           return 2;
         }
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
         const vault: Vault = createVault(root);
-        const gateway = deps.gateway ?? buildGateway(loadConfig(root, env).gateway);
-        const res = await runIngest(input, { vault, gateway }, { io, autoApprove: flags.yes === true });
-        return res ? 0 : 0; // 用户取消也是正常退出（exit 0）
+        const built = !deps.gateway;
+        const gateway = deps.gateway ?? buildReasoningBackend(loadConfig(root, env), flags);
+        try {
+          const res = await runIngest(input, { vault, gateway }, { io, autoApprove: flags.yes === true });
+          return res ? 0 : 0; // 用户取消也是正常退出（exit 0）
+        } finally {
+          if (built) await gateway.dispose();
+        }
       }
 
       case 'ask': {
         const question = positionals.join(' ').trim();
         if (!question) {
-          io.err('用法：wiki ask "<question>"');
+          io.err('用法：wiki ask "<question>" [--agent <id>]');
           return 2;
         }
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
-        const gateway = deps.gateway ?? buildGateway(loadConfig(root, env).gateway);
-        await runAsk(question, { vaultRoot: root, gateway }, { io });
-        return 0;
+        const built = !deps.gateway;
+        const gateway = deps.gateway ?? buildReasoningBackend(loadConfig(root, env), flags);
+        try {
+          await runAsk(question, { vaultRoot: root, gateway }, { io });
+          return 0;
+        } finally {
+          if (built) await gateway.dispose();
+        }
       }
 
       case 'edit': {
         const slug = positionals[0];
         if (!slug) {
-          io.err('用法：wiki edit <slug> [--yes]');
+          io.err('用法：wiki edit <slug> [--yes] [--agent <id>]');
           return 2;
         }
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
         const vault: Vault = createVault(root);
-        const gateway = deps.gateway ?? buildGateway(loadConfig(root, env).gateway);
-        const res = await runEdit(slug, { vault, gateway }, { io, autoApprove: flags.yes === true });
-        return res ? 0 : 0;
+        const built = !deps.gateway;
+        const gateway = deps.gateway ?? buildReasoningBackend(loadConfig(root, env), flags);
+        try {
+          const res = await runEdit(slug, { vault, gateway }, { io, autoApprove: flags.yes === true });
+          return res ? 0 : 0;
+        } finally {
+          if (built) await gateway.dispose();
+        }
       }
 
       case 'lint': {
