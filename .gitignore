@@ -15,3 +15,5 @@ m3-test.log
 
 # 项目自有文档（按约定放本地 docs/，不进仓库）
 docs/
+test/
+wiki/
