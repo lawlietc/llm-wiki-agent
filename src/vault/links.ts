@@ -331,6 +331,7 @@ export function slugifyName(name: string): string {
 export async function generateStubs(root: string, report: LinkReport): Promise<string[]> {
   const today = new Date().toISOString().slice(0, 10);
   const ops: Array<{ relativePath: string; content: string; operationType: 'create' }> = [];
+  const seenPaths = new Set<string>();
 
   for (const dead of report.deadLinks) {
     const slug = slugifyName(dead.target);
@@ -338,7 +339,9 @@ export async function generateStubs(root: string, report: LinkReport): Promise<s
     // kind null → needs_classification（完全未定成分），stub: true 与目录正交（I-g）。
     const rel = entityPagePath(null, slug);
     const abs = path.join(root, rel);
-    if (existsSync(abs)) continue; // 已存在 → skip，不覆盖
+    // 已存在 → skip 不覆盖；同一事务内重复目标（多个来源引用同一死链）→ 只建一次
+    if (existsSync(abs) || seenPaths.has(rel)) continue;
+    seenPaths.add(rel);
     ops.push({
       relativePath: rel,
       content: renderEntityPage({
