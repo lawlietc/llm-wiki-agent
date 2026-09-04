@@ -67,10 +67,12 @@ export class ACPAgentBackend implements ReasoningBackend {
     const t = await this.connect();
     if (this.sessionId) return t;
     try {
-      // 真实 ACP（opencode）要求 session/new 带 cwd + mcpServers，否则 Invalid params（F9.2）
+      // 真实 ACP（opencode 1.18.23）要求 session/new 带 cwd + mcpServers；
+      // mcpServers 必须是**数组**（实测空对象 {} 报 Invalid params: expected array,
+      // received object），否则握手失败（F9.2）。
       const s = await t.connection.request<{ sessionId: string }>('session/new', {
         cwd: this.opts.cwd ?? process.cwd(),
-        mcpServers: {},
+        mcpServers: [],
       });
       this.sessionId = s.sessionId;
       return t;

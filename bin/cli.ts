@@ -68,11 +68,16 @@ function main(): void {
   if (env.LLM_WIKI_FAKE_REPLIES) installFakeTransport(env.LLM_WIKI_FAKE_REPLIES);
   if (env.LLM_WIKI_FAKE_FETCH) installFakeFetch(env.LLM_WIKI_FAKE_FETCH);
 
+  // 用 process.exitCode 而非 process.exit()：后者会立即杀进程、丢弃尚未 flush 的
+  // stdout/stderr 缓冲（真实 ingest 在 finally 里异步 terminate 子进程时尤甚），
+  // 导致错误输出丢失、子进程清理不完整。设 exitCode 后让事件循环自然排空再退出。
   runCli(process.argv.slice(2), { cwd: process.cwd(), env, io: realCliIO() })
-    .then((code) => process.exit(code))
+    .then((code) => {
+      process.exitCode = code;
+    })
     .catch((e) => {
       process.stderr.write(`${String(e)}\n`);
-      process.exit(1);
+      process.exitCode = 1;
     });
 }
 

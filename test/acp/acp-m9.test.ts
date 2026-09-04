@@ -94,7 +94,7 @@ describe('F9.2 后端协议对齐真实 ACP', () => {
     await backend.complete({ prompt: 'hi' });
     const params = readJsonFile(cwdEcho) as { cwd?: string; mcpServers?: unknown };
     expect(params.cwd).toBe('/work/dir');
-    expect(params.mcpServers).toEqual({});
+    expect(params.mcpServers).toEqual([]); // 真实 opencode 要求数组，空对象 {} 报 Invalid params
     await backend.dispose();
   });
 

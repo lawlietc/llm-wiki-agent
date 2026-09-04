@@ -6,6 +6,7 @@
  */
 
 import * as readline from 'node:readline';
+import * as fs from 'node:fs';
 
 export interface CliIO {
   /** 写一行到 stdout（自动补换行） */
@@ -18,11 +19,14 @@ export interface CliIO {
   confirm(prompt: string): Promise<boolean>;
 }
 
-/** 真实 IO：直连 process.stdout/stderr + readline */
+/** 真实 IO：直连 process.stdout/stderr + readline。
+ * out/err 用同步 writeSync：spawn 本地 agent 子进程（Windows shell:true）后，
+ * 异步的 process.stderr.write 缓冲可能被子进程干扰而丢失，导致错误输出不可见；
+ * 同步写 fd 1/2 最稳（F9.5 真实 CLI 端到端修复）。 */
 export function realCliIO(): CliIO {
   return {
-    out: (t) => process.stdout.write(t + '\n'),
-    err: (t) => process.stderr.write(t + '\n'),
+    out: (t) => fs.writeSync(1, t + '\n'),
+    err: (t) => fs.writeSync(2, t + '\n'),
     isTTY: Boolean(process.stdin.isTTY),
     confirm: async (prompt) => {
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
