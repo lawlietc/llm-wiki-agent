@@ -61,9 +61,10 @@ export function renderEntityPage(input: EntityPageInput): string {
   }
 
   const summary = input.summary && input.summary.trim() !== '' ? input.summary.trim() : '（待补全）';
+  const srcRef = input.mention ? `，来源见 [[${input.mention.wikiSlug}]]` : '';
   const body = isStub
-    ? `本页是实体「${input.name}」的占位词条（stub），由 ingest 实体抽取自动建立，待后续补全；来源见 [[${input.mention?.wikiSlug ?? ''}]]。\n\n## 摘要\n\n${summary}\n`
-    : `本页描述实体「${input.name}」，由 ingest 实体抽取自动生成，内容整理自来源页 [[${input.mention?.wikiSlug ?? ''}]]。\n\n## 摘要\n\n${summary}\n${
+    ? `本页是实体「${input.name}」的占位词条（stub），由 ingest 实体抽取或死链占位自动建立，待后续补全${srcRef}。\n\n## 摘要\n\n${summary}\n`
+    : `本页描述实体「${input.name}」，由 ingest 实体抽取自动生成${srcRef}。\n\n## 摘要\n\n${summary}\n${
         input.mention ? `\n## Mentions\n\n> "${input.mention.quote}" — [[${input.mention.wikiSlug}]]\n` : ''
       }`;
 
