@@ -32,7 +32,14 @@ const SYSTEM_INSTRUCTION_EXTRACT =
   '"coverage":"defined|discussed|named","summary":"一句话中文摘要","aliases":["别名"]}],' +
   '"relations":[{"from":"slug","type":"supersedes|depends_on|caused|decides|relates_to|contradicts|superseded_by|required_by|caused_by|decided_by","to":"slug"}]}。' +
   '只抽原文真正讨论的实体（coverage: defined=原文给出定义; discussed=展开讨论; named=仅提及）；' +
-  '关系必须原文明确陈述，绝不虚构；没有关系就输出空数组。';
+  '关系必须原文明确陈述，绝不虚构；没有关系就输出空数组。' +
+  // M13 分类判定树要点（prompt 侧与代码词表双路，D3：启发式结论归 model，代码词表兜底）
+  'kind 判定顺序参考：1) 组织后缀（公司/集团/Inc./Ltd. 等）→ company；2) ADR/决策记录形态 → decision；' +
+  '3) 带称谓（Dr./教授/先生 等）→ person；4) 项目/产品且被原文作为主体展开 → project；' +
+  '5) 抽象术语/方法/机制 → concept；6) 仅点名的工具型产品 → concept。' +
+  'wikilink 测试：只提名值得成为 wiki 页的实体，作者亲手 [[链接]] 的名字优先提名；' +
+  '导航/罗列/栏目类泛化词（如"相关工具""参考资料""其他"）绝不能作为实体抽出；' +
+  '拿不准 kind 时如实给出最接近的猜测，不确定的 coverage 用 named。';
 
 /**
  * 从 LLM 回稿中提取 JSON 对象（容错，I4）：
