@@ -186,4 +186,4 @@ npm run typecheck # tsc --noEmit
 
 测试用 `LLM_WIKI_FAKE_REPLIES` / `LLM_WIKI_FAKE_FETCH` 两个 env 接缝做零网络 E2E（生产从不设置）。
 
-更详细的里程碑规格见 `analysis/llm-wiki-agent/dev-specs/`（SPEC-0 + M1–M8）。
+更详细的里程碑规格见 `docs/dev-specs/`（SPEC-0 + M1–M8）。

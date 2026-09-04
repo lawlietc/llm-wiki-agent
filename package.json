@@ -1,6 +1,6 @@
 {
   "name": "llm-wiki-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "围绕 LLM wiki 的知识整理 agent：ingest raw 文件 → 编辑成 markdown wiki 库 → 问答",
   "type": "module",
