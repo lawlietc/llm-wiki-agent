@@ -21,6 +21,7 @@ import { runIngest } from './ingest';
 import { runAsk } from './ask';
 import { runEdit } from './edit';
 import { runLint } from './lint';
+import { runLink } from './link';
 import { runStatus } from './status';
 import { runIndexRebuild } from './index-rebuild';
 
@@ -111,7 +112,7 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
   const io = deps.io;
 
   if (argv.length === 0) {
-    io.err('用法：wiki <init|ingest|ask|edit|lint|index|status> [...]');
+    io.err('用法：wiki <init|ingest|ask|edit|lint|link|index|status> [...]');
     return 2;
   }
 
@@ -187,6 +188,12 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
           return 2;
         }
         const r = await runLint(file, { io, cwd });
+        return r.exitCode;
+      }
+
+      case 'link': {
+        const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
+        const r = await runLink({ vaultRoot: root }, { io, fix: flags.fix === true });
         return r.exitCode;
       }
 
