@@ -23,9 +23,10 @@ import path from 'node:path';
 
 import { parseNote, type ParsedNote } from '../notes/frontmatter';
 import { renderEntityPage } from '../notes/entity-page';
-import { ENTITY_KINDS } from '../ingest/candidate-gate';
-import { isEntityDir, kindOfPath, UNCLASSIFIED_DIR } from '../notes/kind';
-import { createVault } from './vault';
+import { ENTITY_KINDS, type EntityKind } from '../ingest/candidate-gate';
+import { isEntityDir, kindOfPath, noteTypeFor, entityPagePath, UNCLASSIFIED_DIR } from '../notes/kind';
+import { withFrontmatterKind } from '../notes/kind-frontmatter';
+import { createVault, type VaultWriteOp } from './vault';
 
 const ENTITY_KINDS_SET: ReadonlySet<string> = ENTITY_KINDS;
 
@@ -333,7 +334,9 @@ export async function generateStubs(root: string, report: LinkReport): Promise<s
 
   for (const dead of report.deadLinks) {
     const slug = slugifyName(dead.target);
-    const rel = `wiki/concepts/${slug}.md`;
+    // D8：占位一律落 wiki/notes/（路径形态死链的目录线索有意忽略——死链目标身份未知）；
+    // kind null → needs_classification（完全未定成分），stub: true 与目录正交（I-g）。
+    const rel = entityPagePath(null, slug);
     const abs = path.join(root, rel);
     if (existsSync(abs)) continue; // 已存在 → skip，不覆盖
     ops.push({
@@ -341,7 +344,7 @@ export async function generateStubs(root: string, report: LinkReport): Promise<s
       content: renderEntityPage({
         name: dead.target,
         slug,
-        kind: 'concept',
+        kind: null,
         outcome: 'stub',
         date: today,
         summary: `（占位词条：由死链 [[${dead.target}]] 自动建立，待补全）`,
@@ -357,4 +360,79 @@ export async function generateStubs(root: string, report: LinkReport): Promise<s
   const preview = vault.preview(plan);
   await vault.apply(plan, { approvedPlanSha256: preview.approvalSha256 });
   return ops.map((o) => o.relativePath);
+}
+
+/* ------------------------------ M13 按 entity_kind 迁移（--fix 人工通道） ------------------------------ */
+
+export interface MigrateResult {
+  /** 已完成的迁移（from → to） */
+  migrated: Array<{ from: string; to: string }>;
+  /** entity_kind 非法（忽略不迁移） */
+  invalidKind: Array<{ rel: string; value: string }>;
+  /** 迁移目标已存在同 slug 页（KIND_CONFLICT，不迁移不覆盖） */
+  conflicts: Array<{ rel: string; target: string }>;
+}
+
+/**
+ * 以 frontmatter entity_kind 为准迁移实体页（M13，--fix 的人工通道）：
+ * - 凡 entity_kind 与 kindOfPath(rel) 不符即迁移（覆盖 notes→kind 与 kind→kind 两种纠错）；
+ * - 建议态页（无 entity_kind）不迁移（I-j，幂等免费成立）；
+ * - 非法 entity_kind → 忽略 + 记入 invalidKind（KIND_INVALID）；
+ * - 目标已存在同 slug → KIND_CONFLICT（I-d 无静默覆盖），跳过；
+ * - 迁移 = create(target) + delete(from) 同一 Vault 事务（I-a 原子性，operationType=save）。
+ */
+export async function migrateByFrontmatterKind(root: string): Promise<MigrateResult> {
+  const report = await resolveLinks(root);
+  const result: MigrateResult = { migrated: [], invalidKind: [], conflicts: [] };
+  const ops: VaultWriteOp[] = [];
+
+  const entityPages = report.pages.filter((rel) => isEntityDir(rel));
+  for (const rel of entityPages) {
+    let fm: ParsedNote['frontmatter'];
+    try {
+      fm = parseNote(await readFile(path.join(root, rel), 'utf8')).frontmatter;
+    } catch {
+      continue; // 损坏页跳过
+    }
+    const declared = typeof fm.entity_kind === 'string' ? fm.entity_kind : null;
+    if (declared == null) continue; // 建议态/裸未定 → 不迁移（I-j）
+    if (!ENTITY_KINDS_SET.has(declared)) {
+      result.invalidKind.push({ rel, value: declared });
+      continue;
+    }
+    if (kindOfPath(rel) === declared) continue; // 已在目标目录
+
+    const target = entityPagePath(declared as EntityKind, path.basename(rel).replace(/\.md$/, ''));
+    if (existsSync(path.join(root, target))) {
+      result.conflicts.push({ rel, target });
+      continue;
+    }
+    const content = await readFile(path.join(root, rel), 'utf8');
+    // D6 目标态：type 改写 + entity_kind 写入 + 建议键/needs_classification 移除；正文逐字节不变
+    ops.push(
+      {
+        relativePath: target,
+        content: withFrontmatterKind(content, {
+          type: noteTypeFor(declared as EntityKind),
+          entityKind: declared,
+          needsClassification: null,
+          suggestedKind: null,
+          suggestedSource: null,
+        }),
+        operationType: 'create',
+      },
+      { relativePath: rel, operationType: 'delete' },
+    );
+    result.migrated.push({ from: rel, to: target });
+  }
+
+  if (ops.length > 0) {
+    const vault = createVault(root);
+    const plan = await vault.plan(ops);
+    plan.operationType = 'save';
+    const preview = vault.preview(plan);
+    await vault.apply(plan, { approvedPlanSha256: preview.approvalSha256 });
+  }
+  result.migrated.sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+  return result;
 }
