@@ -15,8 +15,9 @@
  * 纯函数、无 I/O、无 LLM（确定性）。
  */
 
-import { assertPortableWritePath } from '../vault/paths';
 import { isRelationType, type RelationEdge, type RelationType } from '../notes/relations';
+import { classifyEntity, type Classification } from '../notes/classify';
+import { entityPagePath } from '../notes/kind';
 
 export type EntityKind = 'person' | 'project' | 'concept' | 'decision' | 'company';
 export const ENTITY_KINDS: ReadonlySet<string> = new Set<EntityKind>([
@@ -56,6 +57,8 @@ export interface GatedCandidate {
   location: CandidateLocation;
   handLinked: boolean;
   reason: string;
+  /** M13 分类结果（判定树产出；每个候选都有，含 drop 的） */
+  classification: Classification;
 }
 
 export interface GateResult {
@@ -179,15 +182,33 @@ export function applyOutcomeTable(location: CandidateLocation, handLinked: boole
   }
 }
 
-/** slug 必须能过实体页路径白名单 */
-function slugIsValid(slug: string): boolean {
+/** slug 必须能过实体页路径白名单（M13：走 entityPagePath，六类目录同形） */
+function slugIsValid(slug: string, kind: EntityKind): boolean {
   if (typeof slug !== 'string' || slug.trim() === '') return false;
   try {
-    assertPortableWritePath(`wiki/concepts/${slug.trim()}.md`);
+    entityPagePath(kind, slug.trim());
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * 名字（含别名）在正文 prose 中的出现次数（M13 主体判据的输入）。
+ * 括号内与短列表项中的出现不计入 prose。
+ */
+export function countProseOccurrences(body: string, name: string, aliases?: string[]): number {
+  const terms = [name, ...(aliases ?? [])].filter((t) => typeof t === 'string' && t.trim() !== '');
+  const spans = parenSpans(body);
+  let best = 0;
+  for (const term of terms) {
+    const positions = findOccurrences(body, term);
+    const proseCount = positions.filter(
+      (p) => !spans.some(([s, e]) => p > s && p < e) && !inShortListItem(body, p),
+    ).length;
+    if (proseCount > best) best = proseCount;
+  }
+  return best;
 }
 
 /* ------------------------------ 门入口 ------------------------------ */
@@ -197,9 +218,10 @@ function slugIsValid(slug: string): boolean {
  *
  * 规则：
  * 1) name 空 / slug 非法 / absent → drop；kind 非法容错为 concept；coverage 非法降为 named；
- * 2) 同 slug 只保留首个候选；
+ * 2) 同 slug 多提名仲裁（M13）：确定性 basis（lexicon/pin）优先于 model/none，同级先到先得；
  * 3) hand-linked 优先保活（即使 coverage named）；
- * 4) 边只保留两端都存活的合法类型边；自环、非法类型、悬空端点一律剪除（不制造死链）。
+ * 4) 泛化名单（classification.rejected）存活候选降级为 drop（复用通道，注明 reason）；
+ * 5) 边只保留两端都存活的合法类型边；自环、非法类型、悬空端点一律剪除（不制造死链）。
  */
 export function gateCandidates(
   raw: { entities?: unknown; relations?: unknown },
@@ -211,7 +233,8 @@ export function gateCandidates(
 
   // 1) 逐候选分类与路由
   const candidates: GatedCandidate[] = [];
-  const seenSlugs = new Set<string>();
+  /** slug → 已保留候选在 candidates 中的下标（同 slug 仲裁用） */
+  const keptBySlug = new Map<string, number>();
   for (const item of rawEntities) {
     if (item === null || typeof item !== 'object') continue;
     const o = item as Record<string, unknown>;
@@ -229,19 +252,54 @@ export function gateCandidates(
 
     const { location } = classifyCandidate(body, name, aliases);
     const handLinked = isHandLinked(wikiContent, name, aliases);
+    const proseOccurrences = countProseOccurrences(body, name, aliases);
+    const classification = classifyEntity({
+      name,
+      aliases,
+      declaredKind: typeof o.kind === 'string' ? o.kind : undefined, // 原始声明值（可能非法）→ model 信源
+      coverage,
+      location,
+      handLinked,
+      proseOccurrences,
+    });
 
-    if (!slugIsValid(slug)) {
-      candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: 'drop', location, handLinked, reason: 'slug 非法' });
+    const pushDrop = (reason: string) =>
+      candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: 'drop', location, handLinked, reason, classification });
+
+    if (!slugIsValid(slug, kind)) {
+      pushDrop('slug 非法');
       continue;
     }
-    if (seenSlugs.has(slug)) {
-      candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: 'drop', location, handLinked, reason: 'slug 重复' });
+
+    // 同 slug 多提名仲裁：确定性 basis 优先于 model/none；同级先到先得
+    const keptIdx = keptBySlug.get(slug);
+    if (keptIdx !== undefined) {
+      const kept = candidates[keptIdx]!;
+      const deterministic = (c: Classification) => c.basis === 'lexicon' || c.basis === 'pin';
+      if (deterministic(kept.classification) || !deterministic(classification)) {
+        pushDrop('slug 重复（仲裁：先到者胜或确定性优先）');
+        continue;
+      }
+      // 后到的确定性提名顶掉先到的 model/none 提名
+      pushDrop('slug 仲裁落败（被确定性提名取代）');
+      const winner = applyOutcomeTable(location, handLinked, coverage);
+      candidates[keptIdx] = {
+        candidate: { name, slug, kind, coverage, summary, aliases },
+        outcome: winner.outcome,
+        location,
+        handLinked,
+        reason: `slug 仲裁胜出（确定性 basis；${winner.reason}）`,
+        classification,
+      };
       continue;
     }
-    seenSlugs.add(slug);
 
     const { outcome, reason } = applyOutcomeTable(location, handLinked, coverage);
-    candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome, location, handLinked, reason });
+    // 泛化名单（规则 10）：存活候选降级为不建页（复用 drop 通道）
+    const finalOutcome: CandidateOutcome = classification.rejected === true ? 'drop' : outcome;
+    const finalReason = classification.rejected === true ? '泛化名单（不建页）' : reason;
+    keptBySlug.set(slug, candidates.length);
+    candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: finalOutcome, location, handLinked, reason: finalReason, classification });
   }
 
   // 2) 边过滤：端点必须都存活、类型合法、非自环
