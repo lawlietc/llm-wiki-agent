@@ -7,22 +7,31 @@
  * - withFrontmatterRelations：文本层把 relations 块注入页面 frontmatter
  *   （保持页面其余部分字节不变；已有 relations 块先移除再写入 = 幂等）。
  *
- * 词条页 type 取注册表中最接近的 `idea`（02 §5 类型表封闭），真实实体类别记在
- * `entity_kind` 字段；status: captured（stub）/ active（page）对应两阶富集节奏。
+ * 词条页 type 取 noteTypeFor(kind)（02 §5 类型表封闭；company/concept 记 idea），
+ * 真实实体类别按 M13 三态记录：确认态 `entity_kind` / 建议态 `suggested_kind` +
+ * `suggested_source` + `needs_classification` / 裸未定仅 `needs_classification`。
+ * status: captured（stub）/ active（page）对应两阶富集节奏。
  */
 
 import { renderFrontmatter } from './frontmatter';
 import type { NoteFrontmatter } from './types';
 import type { EntityKind } from '../ingest/candidate-gate';
+import { noteTypeFor } from './kind';
+import type { Classification } from './classify';
 
 export interface EntityPageInput {
   name: string;
   slug: string;
-  kind: EntityKind;
+  /** 实体 kind；null = 未确认分类（type 取 idea，写 needs_classification） */
+  kind: EntityKind | null;
   /** page = 存活候选整页；stub = 分歧候选最小占位 */
   outcome: 'page' | 'stub';
   /** YYYY-MM-DD（取 raw fetched_at 日期） */
   date: string;
+  /** M13 分类结果：决定确认态（lexicon/pin）/建议态（model）/裸未定三态。缺省 = 确认态 */
+  classification?: Classification;
+  /** 建议态来源（raw 页相对路径）→ suggested_source */
+  suggestedSource?: string;
   summary?: string;
   aliases?: string[];
   /** type → ['[[target]]']（已含 inverse 反向边） */
@@ -43,17 +52,29 @@ function relationsToFm(relations: Map<string, string[]>): Record<string, string[
 /** 生成实体页完整内容（可直接经 VaultWriteOp 落盘） */
 export function renderEntityPage(input: EntityPageInput): string {
   const isStub = input.outcome === 'stub';
+  const cls = input.classification;
+  const kind = input.kind;
+  // 三态（M13 D4）：确认态（lexicon/pin 或 legacy 缺省）写 entity_kind；
+  // 建议态（model + kind 非空）写 suggested_kind(+source)；其余裸未定只写 needs_classification。
+  const confirmed = kind != null && (cls == null || cls.basis === 'lexicon' || cls.basis === 'pin');
+  const suggesting = !confirmed && cls != null && cls.basis === 'model' && kind != null;
+
   const fm: NoteFrontmatter & Record<string, unknown> = {
     date: input.date,
-    type: 'idea',
+    type: noteTypeFor(kind),
     status: isStub ? 'captured' : 'active',
-    entity_kind: input.kind,
-    tags: ['entity', input.kind],
+    tags: ['entity', kind ?? 'unclassified'],
     'ai-first': true,
     confidence: isStub ? 'medium' : 'high',
     slug: input.slug,
     title: input.name,
   };
+  if (confirmed) fm.entity_kind = kind;
+  if (!confirmed) fm.needs_classification = true;
+  if (suggesting) {
+    fm.suggested_kind = kind;
+    if (input.suggestedSource != null) fm.suggested_source = input.suggestedSource;
+  }
   if (input.aliases && input.aliases.length > 0) fm.aliases = [...input.aliases];
   if (isStub) fm.stub = true;
   if (input.relations && relationsToFm(input.relations) && Object.keys(relationsToFm(input.relations)).length > 0) {

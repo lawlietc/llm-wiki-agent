@@ -158,3 +158,9 @@ export function classifyEntity(input: ClassifyInput): Classification {
   // 规则 12：兜底——全部未命中，裸未定
   return { kind: null, basis: 'none', reason: '全部规则未命中' };
 }
+
+/**
+ * 测试接缝（仿 sources.ts 的 _urlAdapterSeam 先例）：可替换 classifyEntity 实现，
+ * 供 F13.4-11 注入分类模块异常，验证 I-h 降级路径。生产代码勿动。
+ */
+export const _classifySeam: { impl: typeof classifyEntity } = { impl: classifyEntity };

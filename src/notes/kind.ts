@@ -22,6 +22,9 @@ export const KIND_DIR: Record<EntityKind, string> = {
   concept: 'wiki/concepts',
 };
 
+/** 五类 kind 的固定枚举顺序（既有页探测顺序：五 kind 目录 → notes/） */
+export const ALL_KINDS: readonly EntityKind[] = ['person', 'company', 'project', 'decision', 'concept'];
+
 /** 待确认层目录（M13 C3）：未确认分类的实体页落点 */
 export const UNCLASSIFIED_DIR = 'wiki/notes';
 

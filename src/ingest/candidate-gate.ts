@@ -16,7 +16,7 @@
  */
 
 import { isRelationType, type RelationEdge, type RelationType } from '../notes/relations';
-import { classifyEntity, type Classification } from '../notes/classify';
+import { _classifySeam, type Classification } from '../notes/classify';
 import { entityPagePath } from '../notes/kind';
 
 export type EntityKind = 'person' | 'project' | 'concept' | 'decision' | 'company';
@@ -253,15 +253,21 @@ export function gateCandidates(
     const { location } = classifyCandidate(body, name, aliases);
     const handLinked = isHandLinked(wikiContent, name, aliases);
     const proseOccurrences = countProseOccurrences(body, name, aliases);
-    const classification = classifyEntity({
-      name,
-      aliases,
-      declaredKind: typeof o.kind === 'string' ? o.kind : undefined, // 原始声明值（可能非法）→ model 信源
-      coverage,
-      location,
-      handLinked,
-      proseOccurrences,
-    });
+    // I-h：分类模块异常 → 降级 kind:null（落 notes/），不阻断门与 ingest
+    let classification: Classification;
+    try {
+      classification = _classifySeam.impl({
+        name,
+        aliases,
+        declaredKind: typeof o.kind === 'string' ? o.kind : undefined, // 原始声明值（可能非法）→ model 信源
+        coverage,
+        location,
+        handLinked,
+        proseOccurrences,
+      });
+    } catch {
+      classification = { kind: null, basis: 'none', reason: 'CLASSIFY_FAILED（分类模块异常，降级未分类）' };
+    }
 
     const pushDrop = (reason: string) =>
       candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: 'drop', location, handLinked, reason, classification });

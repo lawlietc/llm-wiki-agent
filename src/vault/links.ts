@@ -23,7 +23,11 @@ import path from 'node:path';
 
 import { parseNote, type ParsedNote } from '../notes/frontmatter';
 import { renderEntityPage } from '../notes/entity-page';
+import { ENTITY_KINDS } from '../ingest/candidate-gate';
+import { isEntityDir, kindOfPath, UNCLASSIFIED_DIR } from '../notes/kind';
 import { createVault } from './vault';
+
+const ENTITY_KINDS_SET: ReadonlySet<string> = ENTITY_KINDS;
 
 /* ------------------------------ 数据模型 ------------------------------ */
 
@@ -56,6 +60,14 @@ export interface LinkReport {
   /** 零入链的 wiki/ 页（raw/ 不参与孤儿判定） */
   orphans: string[];
   duplicateBasenames: { basename: string; paths: string[] }[];
+  /** M13 未分类（wiki/notes/）：pending=有建议待确认；undetermined=完全未定（占位页带 （stub） 标记） */
+  unclassified: { pending: string[]; undetermined: string[] };
+  /** M13 entity_kind 与目录不符；或 pin 与 suggested 冲突 */
+  kindMismatch: { rel: string; declared?: string; suggested?: string }[];
+  /** M13 同 slug 多目录并存（error 级，阻塞 exit） */
+  duplicateEntitySlug: { slug: string; paths: string[] }[];
+  /** M13 手填 entity_kind 不在五类内 */
+  invalidKind: { rel: string; value: string }[];
 }
 
 /* ------------------------------ 扫描 ------------------------------ */
@@ -182,6 +194,10 @@ export async function resolveLinks(root: string): Promise<LinkReport> {
     danglingTypedEdges: [],
     orphans: [],
     duplicateBasenames: [],
+    unclassified: { pending: [], undetermined: [] },
+    kindMismatch: [],
+    duplicateEntitySlug: [],
+    invalidKind: [],
   };
   const addBacklink = (target: string, source: string) => {
     const list = report.backlinks[target] ?? [];
@@ -227,6 +243,45 @@ export async function resolveLinks(root: string): Promise<LinkReport> {
   // 同名冲突
   for (const [basename, list] of byBasename) {
     if (list.length > 1) report.duplicateBasenames.push({ basename, paths: list.map((p) => p.rel) });
+  }
+
+  // ---- M13 一致性报告 ----
+  const ENTITY_BASENAMES = new Map<string, string[]>();
+  for (const p of pages) {
+    if (!isEntityDir(p.rel)) continue;
+    // 同 slug 多目录并存（error 级）
+    const list = ENTITY_BASENAMES.get(p.basename) ?? [];
+    list.push(p.rel);
+    ENTITY_BASENAMES.set(p.basename, list);
+
+    const rawKind = p.fm.entity_kind;
+    const declared = typeof rawKind === 'string' ? rawKind : null;
+    const suggested = typeof p.fm.suggested_kind === 'string' ? p.fm.suggested_kind : null;
+
+    if (declared != null && !ENTITY_KINDS_SET.has(declared)) {
+      // 手填非法 kind → 忽略该值、记 invalidKind、不迁移（KIND_INVALID）
+      report.invalidKind.push({ rel: p.rel, value: declared });
+      continue;
+    }
+
+    // 未分类两子段（D10 成分观测）：pending=有建议待确认；undetermined=完全未定
+    if (p.rel.startsWith(`${UNCLASSIFIED_DIR}/`)) {
+      const marked = p.fm.stub === true ? `${p.rel}（stub）` : p.rel;
+      if (suggested != null) report.unclassified.pending.push(marked);
+      else report.unclassified.undetermined.push(marked);
+    }
+
+    // kindMismatch：entity_kind 与目录不符；或 pin 与 suggested 冲突（I-i）
+    if (declared != null && suggested != null && declared !== suggested) {
+      report.kindMismatch.push({ rel: p.rel, declared, suggested });
+      continue;
+    }
+    if (declared != null && kindOfPath(p.rel) !== declared) {
+      report.kindMismatch.push({ rel: p.rel, declared });
+    }
+  }
+  for (const [slug, paths] of ENTITY_BASENAMES) {
+    if (paths.length > 1) report.duplicateEntitySlug.push({ slug, paths });
   }
 
   return report;

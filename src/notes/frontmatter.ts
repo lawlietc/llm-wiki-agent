@@ -294,8 +294,15 @@ function serializeScalar(v: unknown): string {
   if (typeof v === 'boolean') return v ? 'true' : 'false';
   if (typeof v === 'number') return String(v);
   if (typeof v === 'string') {
-    // 含特殊字符（[ ] : # ' 或首尾空格/数字开头）才加引号，保持可读性
-    if (/^[A-Za-z0-9_\-./: ]+$/.test(v) && v.trim() === v && !/^\d/.test(v)) return v;
+    // 含特殊字符（[ ] : # ' 或首尾空格/数字开头）才加引号，保持可读性；
+    // 例外：YYYY-MM-DD 日期保持裸串（M13 D6——加引号会破坏 DATE_RE 校验）
+    if (
+      /^[A-Za-z0-9_\-./: ]+$/.test(v) &&
+      v.trim() === v &&
+      (!/^\d/.test(v) || /^\d{4}-\d{2}-\d{2}$/.test(v))
+    ) {
+      return v;
+    }
     return `'${v.replace(/'/g, "''")}'`;
   }
   if (Array.isArray(v)) return `[${v.map(serializeScalar).join(', ')}]`;
