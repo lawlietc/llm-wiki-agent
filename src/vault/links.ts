@@ -119,8 +119,8 @@ function resolveTarget(target: string, pages: PageInfo[], byBasename: Map<string
   return byMeta;
 }
 
-/** 提取 frontmatter relations 中的类型边目标（值形如 [[target]]） */
-function typedEdgeTargets(fm: ParsedNote['frontmatter']): Array<{ type: string; to: string }> {
+/** 提取 frontmatter relations 中的类型边目标（值形如 [[target]]；M12 graph 复用本口径） */
+export function typedEdgeTargets(fm: ParsedNote['frontmatter']): Array<{ type: string; to: string }> {
   const relations = fm.relations;
   const out: Array<{ type: string; to: string }> = [];
   if (relations === undefined || relations === null || typeof relations !== 'object' || Array.isArray(relations)) {
