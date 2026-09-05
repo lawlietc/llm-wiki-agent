@@ -16,6 +16,7 @@
  */
 
 import { readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import { selectAdapter } from './sources';
@@ -33,6 +34,11 @@ import type { Vault, VaultPlan, ApplyResult, VaultWriteOp } from '../vault/vault
 import type { ReasoningBackend } from '../reasoning/backend';
 
 export type { WikiNote } from './summarize';
+
+/** body 内容指纹（sha256 hex；M14 D1，与 M1 事务哈希同算法）。导出供测试复用 */
+export function sha256Hex(text: string): string {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
 
 export interface IngestDeps {
   vault: Vault;
