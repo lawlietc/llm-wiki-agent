@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { readdir, readFile, writeFile, rename, rm, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, rename, rm, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
@@ -20,6 +20,7 @@ import { ValidationError } from '../../errors';
 import { parseNote } from '../../notes/frontmatter';
 import { tokenize } from '../tokenizer';
 import { DIRTY_MARKER_REL } from '../../vault/transaction';
+import { walkMarkdown } from '../../vault/scan';
 import type { Ranked } from '../../reasoning/types';
 
 /* ----------------------------- 常量（I3 锁死） ----------------------------- */
@@ -51,6 +52,8 @@ interface ChunkMeta {
   path: string; // .index/chunks/<id>.json
   dl: number; // 该 chunk 的 token 数（文档长度）
   slug: string;
+  /** 【M12】wiki 页相对 vault 的路径（读正文寻址用）；旧格式索引缺省 */
+  source?: string;
   confidence?: string;
   snippet: string;
 }
@@ -70,6 +73,7 @@ interface CollectedChunk {
   text: string;
   confidence?: string;
   snippet: string;
+  source: string;
 }
 
 /* ----------------------------- 索引锁（I2） ----------------------------- */
@@ -150,26 +154,24 @@ export function chunkPage(body: string, target = CHUNK_TARGET_CHARS): string[] {
 /** 全量重建 BM25 索引（I1/I2）。完成后清除 dirty 标记。 */
 export async function buildIndex(vaultRoot: string): Promise<void> {
   await withIndexLock(vaultRoot, async () => {
-    const wikiDir = path.join(vaultRoot, 'wiki');
-    let entries: string[] = [];
-    try {
-      entries = await readdir(wikiDir);
-    } catch {
-      entries = [];
-    }
-    const mdFiles = entries.filter((f) => f.endsWith('.md')).sort();
+    // M12 F12.0：递归扫 wiki/**（实体页自 M10 起在子目录；平铺扫描假设使它们从未进过索引）
+    const mdFiles = await walkMarkdown(vaultRoot, 'wiki');
 
     const vocab: IndexFile['vocab'] = {};
     const docs: IndexFile['docs'] = {};
     const chunks: CollectedChunk[] = [];
     const docLens: number[] = [];
+    const seenSlugs = new Set<string>();
 
-    for (const file of mdFiles) {
-      const slug = file.slice(0, -'.md'.length);
-      const abs = path.join(wikiDir, file);
+    for (const rel of mdFiles) {
+      const slug = rel.split('/').pop()!.slice(0, -'.md'.length);
+      // 同名异常态（M13 duplicateEntitySlug）：路径排序首个胜，其余跳过（chunk id 不重复）
+      if (seenSlugs.has(slug)) continue;
+      seenSlugs.add(slug);
+
       let content: string;
       try {
-        content = await readFile(abs, 'utf8');
+        content = await readFile(path.join(vaultRoot, rel), 'utf8');
       } catch {
         continue;
       }
@@ -193,8 +195,8 @@ export async function buildIndex(vaultRoot: string): Promise<void> {
         docLens.push(dl);
 
         const snippet = text.length > SNIPPET_MAX ? `${text.slice(0, SNIPPET_MAX)}…` : text;
-        chunks.push({ chunkId, slug, chunkIndex: i, text, confidence, snippet });
-        docs[chunkId] = { path: chunkRelPath(chunkId), dl, slug, confidence, snippet };
+        chunks.push({ chunkId, slug, chunkIndex: i, text, confidence, snippet, source: rel });
+        docs[chunkId] = { path: chunkRelPath(chunkId), dl, slug, source: rel, confidence, snippet };
 
         // 累加到 vocab（term → df/postings）
         const tf = new Map<string, number>();
@@ -219,6 +221,7 @@ export async function buildIndex(vaultRoot: string): Promise<void> {
           text: c.text,
           confidence: c.confidence,
           snippet: c.snippet,
+          source: c.source,
         }),
       );
     }
@@ -298,6 +301,7 @@ export async function bm25Query(vaultRoot: string, text: string, topK: number): 
         chunkIndex,
         confidence: meta.confidence,
         snippet: meta.snippet,
+        source: meta.source,
       } satisfies Ranked;
     });
 }

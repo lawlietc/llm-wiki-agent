@@ -41,10 +41,11 @@ export interface EmbedOpts {
 /** 检索结果条目（06 检索层与索引层共用；id = 引用锚点，见 06 §2.3） */
 export interface Ranked {
   id: string; // "slug#chunk-NNN" 或 "slug"
-  slug: string; // wiki 页 slug（相对 wiki/ 的去扩展名路径）
+  slug: string; // wiki 页 slug（basename 语义，M12 D4）
   score: number; // 融合后的排序分
   cosine?: number; // 向量余弦相似度（MVP BM25-only 时缺省）
   chunkIndex?: number; // 页内 chunk 序号（引用锚点用）
   confidence?: string; // 页面 frontmatter confidence（重排加权用）
   snippet?: string; // 命中片段（综合层引用展示用）
+  source?: string; // 【M12】wiki 页相对 vault 的路径（如 wiki/concepts/rag.md）；旧格式索引缺省 → 回退按 slug 解析
 }

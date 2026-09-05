@@ -17,7 +17,7 @@
  * （内部元数据，与 `.index/` 同层，不经白名单）。
  */
 
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
@@ -27,6 +27,7 @@ import { ENTITY_KINDS, type EntityKind } from '../ingest/candidate-gate';
 import { isEntityDir, kindOfPath, noteTypeFor, entityPagePath, UNCLASSIFIED_DIR } from '../notes/kind';
 import { withFrontmatterKind } from '../notes/kind-frontmatter';
 import { createVault, type VaultWriteOp } from './vault';
+import { walkMarkdown } from './scan';
 
 const ENTITY_KINDS_SET: ReadonlySet<string> = ENTITY_KINDS;
 
@@ -73,28 +74,7 @@ export interface LinkReport {
 
 /* ------------------------------ 扫描 ------------------------------ */
 
-const SKIP_DIRS = new Set(['.vault-meta', '.index', '.git', 'node_modules']);
-
-/** 递归收集 vault 下全部 .md（相对路径，posix） */
-async function walkMarkdown(root: string, dir: string = root): Promise<string[]> {
-  const out: string[] = [];
-  let entries;
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    return out;
-  }
-  for (const e of entries) {
-    if (e.isDirectory()) {
-      if (SKIP_DIRS.has(e.name)) continue;
-      out.push(...(await walkMarkdown(root, path.join(dir, e.name))));
-    } else if (e.isFile() && e.name.endsWith('.md')) {
-      const rel = path.relative(root, path.join(dir, e.name)).split(path.sep).join('/');
-      out.push(rel);
-    }
-  }
-  return out;
-}
+// SKIP_DIRS 与 walkMarkdown 收口到 src/vault/scan.ts（M12 I13：links/bm25/slugIndex/graph 四消费者共用）
 
 /** 解析页面：损坏 frontmatter 容错（fm 记空对象，正文用全文） */
 function safeParse(content: string): ParsedNote {

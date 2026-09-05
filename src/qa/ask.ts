@@ -4,14 +4,14 @@
  * 流程：expand(可选多子查询) → hybridRetrieve(每子查询) → 按 slug 聚合 pages → synthesize。
  * 索引查询纯 CPU（无 LLM）；仅 synthesize/expand 触发 gateway（DoD）。
  * MVP：RetrievalContext 仅填 pages，takes/edges 恒为 []（第三刀 GATHER 后才有）。
+ * M12 F12.0：pages 正文按命中项的 source（页相对路径）读取——实体页自 M10 起在
+ * wiki/ 子目录，平铺拼路径的假设使其从未可读；source 缺失（旧格式索引）时回退
+ * 按 slug 在 wiki/** 中解析，再缺失返回空串（不拖垮问答）。
  */
-
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
 
 import type { ReasoningBackend } from '../reasoning/backend';
 import type { Ranked } from '../reasoning/types';
-import { parseNote } from '../notes/frontmatter';
+import { findPageBySlug, readPageBodyByRel } from '../vault/scan';
 import { bm25Query } from './index/bm25';
 import { hybridRetrieve } from './retrieve';
 import { synthesize, type RetrievalContext, type SynthesisResult } from './synthesize';
@@ -38,14 +38,11 @@ function mergeByScore(lists: Ranked[][]): Ranked[] {
   return [...m.values()].sort((a, b) => b.score - a.score);
 }
 
-/** 读 wiki 页正文（供综合层 pages 上下文；读不到返回空串，不拖垮问答） */
-async function readWikiBody(root: string, slug: string): Promise<string> {
-  try {
-    const content = await readFile(path.join(root, 'wiki', `${slug}.md`), 'utf8');
-    return parseNote(content).body;
-  } catch {
-    return '';
-  }
+/** 读 wiki 页正文（供综合层 pages 上下文）：优先按命中项 source 寻址，回退 slug 解析；读不到返回空串 */
+async function readPageBody(root: string, hit: Ranked): Promise<string> {
+  if (hit.source) return readPageBodyByRel(root, hit.source);
+  const rel = await findPageBySlug(root, hit.slug);
+  return rel ? readPageBodyByRel(root, rel) : '';
 }
 
 /**
@@ -66,10 +63,12 @@ export async function ask(question: string, deps: AskDeps): Promise<SynthesisRes
   }
   const merged = mergeByScore(hitLists);
 
-  // 按 slug 聚合 pages 上下文（T5.5-05：takes/edges 恒为 []）
+  // 按 slug 聚合 pages 上下文（T5.5-05：takes/edges 恒为 []；正文按 source 寻址）
+  // M12 I15：slugs 保持融合分数降序且去重，同一份序列同时喂 <pages> 与（F12.3 起）subgraphFor。
   const slugs = [...new Set(merged.map((h) => h.slug))];
+  const bySlug = new Map(merged.map((h) => [h.slug, h]));
   const pages = await Promise.all(
-    slugs.map(async (slug) => ({ slug, body: await readWikiBody(deps.vaultRoot, slug) })),
+    slugs.map(async (slug) => ({ slug, body: await readPageBody(deps.vaultRoot, bySlug.get(slug)!) })),
   );
 
   const ctx: RetrievalContext = { pages, takes: [], edges: [] };
