@@ -134,13 +134,27 @@ describe('F12.3 ask 图接线与引用政策', () => {
     }
   });
 
-  it('T12.3-08 既有形态校验不破：非法锚点仍硬失败（T5.4-06 语义，CITATION_FORMAT）', async () => {
+  it('T12.3-08 既有形态校验不破：真正非法的锚点仍硬失败（T5.4-06 语义，CITATION_FORMAT）', async () => {
     tv = await makeVault({ files: FILES });
     await buildIndex(tv.root);
-    const gw = gwFor(JSON.stringify({ answer: 'a', citations: ['bad-anchor'], gaps: [] }));
+    const gw = gwFor(JSON.stringify({ answer: 'a', citations: ['bad citation with space'], gaps: [] }));
     await expect(ask('retrieval', { vaultRoot: tv.root, gateway: gw })).rejects.toThrowError(/非法引用锚点/);
     await expect(ask('retrieval', { vaultRoot: tv.root, gateway: gw })).rejects.toMatchObject({
       code: 'CITATION_FORMAT',
     });
+  });
+
+  it('T12.3-09 裸 slug 锚点确定性修复（M12 真机补强）：漏方括号 → 补齐并正常引用', async () => {
+    tv = await makeVault({ files: FILES });
+    await buildIndex(tv.root);
+    const reply = JSON.stringify({
+      answer: '答案引用 [rag]',
+      citations: ['rag', 'rag#chunk-0'], // 裸 slug / 裸 slug#chunk（opencode 真机形态）
+      gaps: [],
+    });
+    const gw = gwFor(reply);
+    const res = await ask('retrieval', { vaultRoot: tv.root, gateway: gw });
+    expect(res.citations).toEqual(['[rag]', '[rag#chunk-0]']); // 修复 + 去重
+    expect(res.gaps).toEqual([]);
   });
 });

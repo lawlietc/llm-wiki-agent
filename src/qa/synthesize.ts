@@ -34,14 +34,17 @@ export interface RetrievalContext {
 }
 
 /** 系统提示：6 条硬规则全文（T5.4-01 快照）。mode 预留（research 模式暂同 answer）。
- * M12 D11 补一句引用归属引导（<graph> 引入邻居 slug 后压低越界引用率） */
+ * M12 D11 补一句引用归属引导（<graph> 引入邻居 slug 后压低越界引用率）；
+ * M12 真机补强（承 M9 F9.5 教训）：opencode 等强人格 agent 常输出散文/围栏，
+ * 必须显式要求只输出 JSON 对象本身。 */
 export function buildThinkSystemPrompt(_opts: { mode: 'answer' | 'research' }): string {
   return [
     '你是知识综合引擎。输入含 <pages> 检索页、<takes> 要点、<graph> 关系边。',
     '硬规则：',
     ...THINK_HARD_RULES,
     '引用锚点必须是 <pages> 中出现过的页；关系主张引用图中属于命中页的一端。',
-    '输出 JSON：{ "answer": string, "citations": string[], "gaps": string[] }',
+    '必须且只输出一个 JSON 对象（{"answer": string, "citations": string[], "gaps": string[]}），',
+    '不要任何前言说明、不要解释、不要代码块围栏，直接输出 JSON 本身。',
   ].join('\n');
 }
 
@@ -96,9 +99,23 @@ function anchorSlug(c: string): string {
   return c.slice(1, -1).split('#')[0] ?? '';
 }
 
+/** 引用锚点合法形态的宽松版（用于确定性修复判定） */
+const BARE_ANCHOR_RE = /^[\w-]+(?:#chunk-\d+)?$/;
+
+/**
+ * 形态确定性修复（M12 真机补强，承 M9）：强人格 agent 常输出裸 slug（漏方括号），
+ * 语义无歧义 → 补方括号；含空格等真正非法形态 → 返回 null（交由 CITATION_FORMAT 硬失败）。
+ */
+function normalizeCitation(c: string): string | null {
+  const t = c.trim();
+  if (CITATION_RE.test(t)) return t;
+  if (BARE_ANCHOR_RE.test(t)) return `[${t}]`;
+  return null;
+}
+
 /**
  * citations 校验 + 引用归属（M12 D11/I14）：
- * - 形态非法 → 硬失败 CITATION_FORMAT（T5.4-06 语义不变）；
+ * - 形态非法（修复不了）→ 硬失败 CITATION_FORMAT（T5.4-06 语义：真正非法的形态仍拒绝）；
  * - 形态合法但页级 slug 不在 pages 白名单（<graph> 带来的邻居被引用）→ **软降级**：
  *   从 citations 剔除并记录（由调用方落 gaps 说明），不改 answer、不抛错。
  */
@@ -113,16 +130,20 @@ function validateCitations(
   const dropped = new Set<string>();
   const out: string[] = [];
   for (const c of raw) {
-    if (typeof c !== 'string' || !CITATION_RE.test(c)) {
+    if (typeof c !== 'string') {
       throw new ValidationError('CITATION_FORMAT', `非法引用锚点：${String(c)}`);
     }
-    if (!whitelist.has(anchorSlug(c))) {
-      dropped.add(anchorSlug(c));
+    const fixed = normalizeCitation(c);
+    if (fixed == null) {
+      throw new ValidationError('CITATION_FORMAT', `非法引用锚点：${c}`);
+    }
+    if (!whitelist.has(anchorSlug(fixed))) {
+      dropped.add(anchorSlug(fixed));
       continue;
     }
-    if (!seen.has(c)) {
-      seen.add(c);
-      out.push(c);
+    if (!seen.has(fixed)) {
+      seen.add(fixed);
+      out.push(fixed);
     }
   }
   return { citations: out, droppedSlugs: [...dropped].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)) };

@@ -68,7 +68,7 @@ describe('F5.4 综合层 synthesize', () => {
     await expect(synthesize('q', ctx, gw)).rejects.toThrow(ValidationError);
   });
 
-  it('T5.4-06 citations 去重且为合法锚点形态（[slug] / [slug#chunk-N] 正则校验）', async () => {
+  it('T5.4-06 citations 去重且为合法锚点形态（[slug] / [slug#chunk-N] 正则校验；M12：裸 slug 修复）', async () => {
     const gw = new FakeGateway({
       defaultReply: JSON.stringify({
         answer: 'a',
@@ -79,9 +79,16 @@ describe('F5.4 综合层 synthesize', () => {
     const res = await synthesize('q', ctx, gw);
     expect(res.citations).toEqual(['[vector-db]', '[vector-db#chunk-3]']); // 去重
 
-    // 非法锚点 → ValidationError
+    // 裸 slug → M12 确定性修复为方括号形态
+    const gwBare = new FakeGateway({
+      defaultReply: JSON.stringify({ answer: 'a', citations: ['vector-db'], gaps: [] }),
+    });
+    const resBare = await synthesize('q', ctx, gwBare);
+    expect(resBare.citations).toEqual(['[vector-db]']);
+
+    // 真正非法（含空格，修复不了）→ ValidationError
     const gw2 = new FakeGateway({
-      defaultReply: JSON.stringify({ answer: 'a', citations: ['vector-db 没括号', '[bad citation]'], gaps: [] }),
+      defaultReply: JSON.stringify({ answer: 'a', citations: ['[bad citation]'], gaps: [] }),
     });
     await expect(synthesize('q', ctx, gw2)).rejects.toThrow(ValidationError);
   });
