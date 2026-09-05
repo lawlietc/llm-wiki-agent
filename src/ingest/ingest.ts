@@ -20,6 +20,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import { selectAdapter } from './sources';
+import { normalizeSourceUrl } from './source-url';
 import { renderRawNote } from '../notes/template';
 import { parseFrontmatter } from '../notes/frontmatter';
 import { summarizeToWiki } from './summarize';
@@ -55,6 +56,8 @@ export interface IngestOptions {
   approve?: (ctx: ApproveContext) => Promise<boolean>;
   /** 冲突快照打印通道（io.err）：approve 之前即时可见（Q2 拍板） */
   io?: { err(text: string): void };
+  /** 【M14】内容短路命中回调（CLI 打印「内容未变更」）；plan 组装后、approve 之前触发（D9） */
+  onSkip?: () => void;
 }
 
 /** sourceUrl → raw 页文件名（稳定、可移植；去协议/query，非字母数字转 `-`） */
@@ -78,7 +81,9 @@ async function existsRel(vault: Vault, rel: string): Promise<boolean> {
   }
 }
 
-/** I4 去重：扫描 raw/ 找 source_url 命中的页，返回其相对路径（未命中返回 null） */
+/** I4 去重：扫描 raw/ 找 source_url 命中的页，返回其相对路径（未命中返回 null）。
+ * M14 D6 两级匹配：① fm.source_url 字符串全等（规范化值快路径）；
+ * ② 把存量页记录的旧形式（相对/file:///、junction 等）规范化后比对 → 存量页收敛到同一 raw 页。 */
 async function findRawBySourceUrl(vault: Vault, sourceUrl: string): Promise<string | null> {
   const rawDir = path.join(vault.root, 'raw');
   let entries: string[];
@@ -92,6 +97,17 @@ async function findRawBySourceUrl(vault: Vault, sourceUrl: string): Promise<stri
     try {
       const fm = parseFrontmatter(await vault.read(`raw/${f}`));
       if (fm.source_url === sourceUrl) return `raw/${f}`;
+    } catch {
+      /* 跳过损坏/不可读文件 */
+    }
+  }
+  for (const f of entries) {
+    if (!f.endsWith('.md')) continue;
+    try {
+      const fm = parseFrontmatter(await vault.read(`raw/${f}`));
+      if (typeof fm.source_url === 'string' && normalizeSourceUrl(fm.source_url) === sourceUrl) {
+        return `raw/${f}`;
+      }
     } catch {
       /* 跳过损坏/不可读文件 */
     }
@@ -440,77 +456,109 @@ export async function ingest(
   const adapter = selectAdapter(input);
   const { body, meta } = await adapter.extract(input);
 
-  // 1) raw 页（verbatim，type:source，免前言）
+  // 1) raw 页（verbatim，type:source，免前言；M14：body 指纹注入 meta）
+  const sha = sha256Hex(body);
+  meta.sourceSha256 = sha;
   const rawSlug = rawSlugFor(meta.sourceUrl);
   const rawRel = `raw/${rawSlug}.md`;
   const existingRaw = await findRawBySourceUrl(deps.vault, meta.sourceUrl);
+
+  // M14 C2：内容短路（I17 只看指纹；I19 存量无指纹 → 全流程回填）
+  let skipLLM = false;
+  if (existingRaw) {
+    try {
+      const prevFm = parseFrontmatter(await deps.vault.read(existingRaw));
+      skipLLM = typeof prevFm.source_sha256 === 'string' && prevFm.source_sha256 === sha;
+    } catch {
+      skipLLM = false; // 损坏页 → 不短路
+    }
+  }
+
   const rawOp: VaultWriteOp = existingRaw
     ? { relativePath: existingRaw, content: renderRawNote(body, meta), operationType: 'update' }
     : { relativePath: rawRel, content: renderRawNote(body, meta), operationType: 'create' };
 
-  // 2) wiki 页（ai-first，LLM 整理，过反伪造 + lint 闸门；slug 命中已存在 → update）
-  const wiki = await summarizeToWiki(body, meta.sourceUrl, deps.gateway);
+  // 2) wiki 页（ai-first，LLM 整理，过反伪造 + lint 闸门；slug 命中已存在 → update）。
+  // M14：短路时跳过全部 LLM 与 wiki/实体页写入（I18——wiki 页可能已被手工编辑/毕业）。
+  const wiki = skipLLM ? null : await summarizeToWiki(body, meta.sourceUrl, deps.gateway);
 
   // 2.5) 实体抽取（E1/E2，07 规划 D1/D2）：LLM 提议 + 确定性门 + 分类判定树落地。
   // 抽取回稿不可解析时降级为空（不建词条、不写 relations），不阻断 ingest 主流程（I4）。
   let gated: GateResult = { candidates: [], edges: [] };
-  try {
-    const extraction = await extractEntities(body, meta.sourceUrl, deps.gateway);
-    gated = gateCandidates(extraction, body, wiki.content);
-  } catch {
-    /* 降级：本次无实体页 */
+  if (!skipLLM) {
+    try {
+      const extraction = await extractEntities(body, meta.sourceUrl, deps.gateway);
+      gated = gateCandidates(extraction, body, wiki!.content);
+    } catch {
+      /* 降级：本次无实体页 */
+    }
   }
 
-  const ingestDate = meta.fetchedAt.slice(0, 10);
-  const alive = gated.candidates.filter((c) => c.outcome !== 'drop');
+  if (!skipLLM) {
+    const ingestDate = meta.fetchedAt.slice(0, 10);
+    const alive = gated.candidates.filter((c) => c.outcome !== 'drop');
 
-  // 边统一补全：实体间声明边 + 来源页 relates_to 实体（对称），再按 inverse 取双向
-  const allEdges = [
-    ...gated.edges,
-    ...alive.map((c) => ({ from: wiki.slug, type: 'relates_to' as const, to: c.candidate.slug })),
-  ].filter((e) => e.from !== e.to);
-  const relMap = groupRelationsBySlug(allEdges);
+    // 边统一补全：实体间声明边 + 来源页 relates_to 实体（对称），再按 inverse 取双向
+    const allEdges = [
+      ...gated.edges,
+      ...alive.map((c) => ({ from: wiki!.slug, type: 'relates_to' as const, to: c.candidate.slug })),
+    ].filter((e) => e.from !== e.to);
+    const relMap = groupRelationsBySlug(allEdges);
 
-  // 来源页 frontmatter 写入 relations（relates_to → 各存活实体；幂等注入）
-  const wikiRels = relMap.get(wiki.slug) ?? new Map<string, string[]>();
-  const wikiContent = wikiRels.size > 0 ? withFrontmatterRelations(wiki.content, wikiRels) : wiki.content;
+    // 来源页 frontmatter 写入 relations（relates_to → 各存活实体；幂等注入）
+    const wikiRels = relMap.get(wiki!.slug) ?? new Map<string, string[]>();
+    const wikiContent = wikiRels.size > 0 ? withFrontmatterRelations(wiki!.content, wikiRels) : wiki!.content;
 
-  const wikiRel = `wiki/${wiki.slug}.md`;
-  const wikiExists = await existsRel(deps.vault, wikiRel);
-  const wikiOp: VaultWriteOp = {
-    relativePath: wikiRel,
-    content: wikiContent,
-    operationType: wikiExists ? 'update' : 'create',
-  };
+    const wikiRel = `wiki/${wiki!.slug}.md`;
+    const wikiExists = await existsRel(deps.vault, wikiRel);
+    const wikiOp: VaultWriteOp = {
+      relativePath: wikiRel,
+      content: wikiContent,
+      operationType: wikiExists ? 'update' : 'create',
+    };
 
-  // 2.6) 实体页 ops（E3 + M13）：planEntityWrite 统一产出新建/原地升级/跨目录迁移；
-  // 冲突经 io.err 即时打印（发生在 approve 之前，Q2 拍板），不阻断不进返回值。
-  const onConflict = (line: string) => opts?.io?.err(line);
-  const entityOps: VaultWriteOp[] = [];
-  for (const c of alive) {
-    entityOps.push(
-      ...(await planEntityWrite({
-        vault: deps.vault,
-        gated: c,
-        sourceRel: existingRaw ?? rawRel,
-        relMap,
-        date: ingestDate,
-        wikiSlug: wiki.slug,
-        body,
-        onConflict,
-      })),
-    );
+    // 2.6) 实体页 ops（E3 + M13）：planEntityWrite 统一产出新建/原地升级/跨目录迁移；
+    // 冲突经 io.err 即时打印（发生在 approve 之前，Q2 拍板），不阻断不进返回值。
+    const onConflict = (line: string) => opts?.io?.err(line);
+    const entityOps: VaultWriteOp[] = [];
+    for (const c of alive) {
+      entityOps.push(
+        ...(await planEntityWrite({
+          vault: deps.vault,
+          gated: c,
+          sourceRel: existingRaw ?? rawRel,
+          relMap,
+          date: ingestDate,
+          wikiSlug: wiki!.slug,
+          body,
+          onConflict,
+        })),
+      );
+    }
+
+    // 3) raw + wiki + 实体页 同一次事务（operationType=ingest）
+    const planFull = await deps.vault.plan([rawOp, wikiOp, ...entityOps]);
+    planFull.operationType = 'ingest';
+    const previewFull = deps.vault.preview(planFull);
+
+    // 4) 暂停点：approve 拒绝 → 丢弃，零写入（I3）
+    const approvedFull = opts?.approve ? await opts.approve({ plan: planFull, preview: previewFull }) : true;
+    if (!approvedFull) return null;
+
+    // 5) 事务原子落盘（任一步失败整体回滚）
+    return deps.vault.apply(planFull, { approvedPlanSha256: previewFull.approvalSha256 });
   }
 
-  // 3) raw + wiki + 实体页 同一次事务（operationType=ingest）
-  const plan = await deps.vault.plan([rawOp, wikiOp, ...entityOps]);
-  plan.operationType = 'ingest';
-  const preview = deps.vault.preview(plan);
+  // M14 短路路径：仅 raw 页 update（fetched_at 刷新 + 指纹写入/回填），wiki/实体页零触碰（I18）
+  const planSkip = await deps.vault.plan([rawOp]);
+  planSkip.operationType = 'ingest';
+  const previewSkip = deps.vault.preview(planSkip);
 
-  // 4) 暂停点：approve 拒绝 → 丢弃，零写入（I3）
-  const approved = opts?.approve ? await opts.approve({ plan, preview }) : true;
-  if (!approved) return null;
+  // onSkip 在 approve 之前触发（D9）：用户批准前就知道这次为什么只写一个文件
+  opts?.onSkip?.();
 
-  // 5) 事务原子落盘（任一步失败整体回滚）
-  return deps.vault.apply(plan, { approvedPlanSha256: preview.approvalSha256 });
+  const approvedSkip = opts?.approve ? await opts.approve({ plan: planSkip, preview: previewSkip }) : true;
+  if (!approvedSkip) return null;
+
+  return deps.vault.apply(planSkip, { approvedPlanSha256: previewSkip.approvalSha256 });
 }

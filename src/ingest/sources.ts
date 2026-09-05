@@ -10,6 +10,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { ConfigError, TransientError, ValidationError } from '../errors';
 import { normalizeGatewayError } from '../reasoning/gateway-backend';
+import { normalizeSourceUrl } from './source-url';
 import type { SourceMeta } from '../notes/template';
 
 export type { SourceMeta } from '../notes/template';
@@ -33,7 +34,8 @@ export const FILE_ADAPTER: SourceAdapter = {
   async extract(i) {
     const p = stripFileProto(i);
     const body = readFileSync(p, 'utf8');
-    return { body, meta: { sourceUrl: i, fetchedAt: new Date().toISOString() } };
+    // M14 C3：source_url 规范化为 realpath 绝对路径（相对/file:// /junction 形态收敛）
+    return { body, meta: { sourceUrl: normalizeSourceUrl(i), fetchedAt: new Date().toISOString() } };
   },
 };
 
