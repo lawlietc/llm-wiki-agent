@@ -38,6 +38,9 @@ export async function runIngest(
   opts: IngestCommandOpts,
 ): Promise<IngestResult | null> {
   const result = await ingest(input, deps, {
+    io: opts.io,
+    // M14：内容短路命中 → approve 前提示（plan 只含 raw 元数据刷新）
+    onSkip: () => opts.io.out('内容未变更：跳过 LLM 整理与实体抽取（仅刷新 raw 元数据）'),
     approve: async ({ preview }) => {
       opts.io.out(formatChangedPaths(preview.changedPaths));
       if (opts.autoApprove) return true;
