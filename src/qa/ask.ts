@@ -7,12 +7,14 @@
  * M12 F12.0：pages 正文按命中项的 source（页相对路径）读取——实体页自 M10 起在
  * wiki/ 子目录，平铺拼路径的假设使其从未可读；source 缺失（旧格式索引）时回退
  * 按 slug 在 wiki/** 中解析，再缺失返回空串（不拖垮问答）。
+ * M12 F12.3：edges 接 relations 图的命中页一跳子图（07 §4 M12.2，替换硬编码 []）。
  */
 
 import type { ReasoningBackend } from '../reasoning/backend';
 import type { Ranked } from '../reasoning/types';
 import { findPageBySlug, readPageBodyByRel } from '../vault/scan';
 import { bm25Query } from './index/bm25';
+import { buildEdgesFromVault, subgraphFor } from './graph';
 import { hybridRetrieve } from './retrieve';
 import { synthesize, type RetrievalContext, type SynthesisResult } from './synthesize';
 
@@ -63,14 +65,17 @@ export async function ask(question: string, deps: AskDeps): Promise<SynthesisRes
   }
   const merged = mergeByScore(hitLists);
 
-  // 按 slug 聚合 pages 上下文（T5.5-05：takes/edges 恒为 []；正文按 source 寻址）
-  // M12 I15：slugs 保持融合分数降序且去重，同一份序列同时喂 <pages> 与（F12.3 起）subgraphFor。
+  // 按 slug 聚合 pages 上下文；正文按 source 寻址（F12.0）
+  // M12 I15：slugs 保持融合分数降序且去重，同一份序列同时喂 <pages> 与 subgraphFor。
   const slugs = [...new Set(merged.map((h) => h.slug))];
   const bySlug = new Map(merged.map((h) => [h.slug, h]));
   const pages = await Promise.all(
     slugs.map(async (slug) => ({ slug, body: await readPageBody(deps.vaultRoot, bySlug.get(slug)!) })),
   );
 
-  const ctx: RetrievalContext = { pages, takes: [], edges: [] };
+  // M12 E5：relations 图 → 命中页一跳子图（替换 MVP 硬编码 []）。
+  // 图构建纯读零 LLM（I7）；无 relations 库 → 空子图，<graph> 段为空（I12 回归安全）。
+  const graphEdges = await buildEdgesFromVault(deps.vaultRoot);
+  const ctx: RetrievalContext = { pages, takes: [], edges: subgraphFor(graphEdges, slugs) };
   return synthesize(question, ctx, deps.gateway);
 }

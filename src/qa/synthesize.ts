@@ -33,12 +33,14 @@ export interface RetrievalContext {
   edges: { from: string; type: string; to: string }[]; // MVP 传 []（GATHER 后才有）
 }
 
-/** 系统提示：6 条硬规则全文（T5.4-01 快照）。mode 预留（research 模式暂同 answer） */
+/** 系统提示：6 条硬规则全文（T5.4-01 快照）。mode 预留（research 模式暂同 answer）。
+ * M12 D11 补一句引用归属引导（<graph> 引入邻居 slug 后压低越界引用率） */
 export function buildThinkSystemPrompt(_opts: { mode: 'answer' | 'research' }): string {
   return [
     '你是知识综合引擎。输入含 <pages> 检索页、<takes> 要点、<graph> 关系边。',
     '硬规则：',
     ...THINK_HARD_RULES,
+    '引用锚点必须是 <pages> 中出现过的页；关系主张引用图中属于命中页的一端。',
     '输出 JSON：{ "answer": string, "citations": string[], "gaps": string[] }',
   ].join('\n');
 }
@@ -89,22 +91,41 @@ export function extractJson(text: string): string {
   throw new ValidationError('SYNTHESIS_NO_JSON', '综合层返回 JSON 对象未闭合');
 }
 
-function validateCitations(raw: unknown): string[] {
+/** 从锚点提取页级 slug（[slug] / [slug#chunk-NNN] → slug） */
+function anchorSlug(c: string): string {
+  return c.slice(1, -1).split('#')[0] ?? '';
+}
+
+/**
+ * citations 校验 + 引用归属（M12 D11/I14）：
+ * - 形态非法 → 硬失败 CITATION_FORMAT（T5.4-06 语义不变）；
+ * - 形态合法但页级 slug 不在 pages 白名单（<graph> 带来的邻居被引用）→ **软降级**：
+ *   从 citations 剔除并记录（由调用方落 gaps 说明），不改 answer、不抛错。
+ */
+function validateCitations(
+  raw: unknown,
+  whitelist: ReadonlySet<string>,
+): { citations: string[]; droppedSlugs: string[] } {
   if (!Array.isArray(raw)) {
     throw new ValidationError('SYNTHESIS_BAD_CITATIONS', 'citations 须为数组');
   }
   const seen = new Set<string>();
+  const dropped = new Set<string>();
   const out: string[] = [];
   for (const c of raw) {
     if (typeof c !== 'string' || !CITATION_RE.test(c)) {
       throw new ValidationError('CITATION_FORMAT', `非法引用锚点：${String(c)}`);
+    }
+    if (!whitelist.has(anchorSlug(c))) {
+      dropped.add(anchorSlug(c));
+      continue;
     }
     if (!seen.has(c)) {
       seen.add(c);
       out.push(c);
     }
   }
-  return out;
+  return { citations: out, droppedSlugs: [...dropped].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)) };
 }
 
 /**
@@ -140,8 +161,16 @@ export async function synthesize(
     throw new ValidationError('SYNTHESIS_BAD_JSON', 'answer 须为字符串');
   }
 
-  const citations = validateCitations(parsed.citations);
-  const gaps = Array.isArray(parsed.gaps) ? parsed.gaps.filter((g) => typeof g === 'string') : [];
+  const { citations, droppedSlugs } = validateCitations(
+    parsed.citations,
+    new Set(ctx.pages.map((p) => p.slug)),
+  );
+  const parsedGaps = Array.isArray(parsed.gaps) ? parsed.gaps.filter((g) => typeof g === 'string') : [];
+  // D11：被剥的越界引用落 gaps 说明（不静默），answer 文本不改写
+  const gaps =
+    droppedSlugs.length > 0
+      ? [...parsedGaps, `引用了未提供正文的页（已从 citations 剔除）：${droppedSlugs.join(', ')}`]
+      : parsedGaps;
 
-  return { answer: parsed.answer, citations, gaps: gaps as string[] };
+  return { answer: parsed.answer, citations, gaps };
 }
