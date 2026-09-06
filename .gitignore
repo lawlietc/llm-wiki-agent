@@ -17,4 +17,5 @@ m3-test.log
 docs/
 test/
 wiki/
-notes/
+# 只忽略仓库根级 notes/（内容目录）；不能写 notes/——会连带忽略 src/notes/（M13 实体分类源码）
+/notes/

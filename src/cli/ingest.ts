@@ -22,6 +22,12 @@ export interface IngestCommandOpts {
   io: CliIO;
   /** --yes 非交互模式：跳过暂停直接 approve（CI/脚本用） */
   autoApprove?: boolean;
+  /** M15 D5：采纳磁盘现状为基线（存量逃生口，存量首次重跑不被冲突拒绝） */
+  adopt?: boolean;
+  /** M15 D6：覆盖前把被改旧版快照到 .vault-meta/conflicts/ */
+  overwrite?: boolean;
+  /** M15：忽略短路条件强制全流程（换模型重抽 / 页丢失后重建） */
+  force?: boolean;
 }
 
 export interface IngestResult {
@@ -39,6 +45,9 @@ export async function runIngest(
 ): Promise<IngestResult | null> {
   const result = await ingest(input, deps, {
     io: opts.io,
+    force: opts.force,
+    adopt: opts.adopt,
+    overwrite: opts.overwrite,
     // M14：内容短路命中 → approve 前提示（plan 只含 raw 元数据刷新）
     onSkip: () => opts.io.out('内容未变更：跳过 LLM 整理与实体抽取（仅刷新 raw 元数据）'),
     approve: async ({ preview }) => {

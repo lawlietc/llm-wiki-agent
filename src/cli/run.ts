@@ -131,7 +131,7 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
       case 'ingest': {
         const input = positionals[0];
         if (!input) {
-          io.err('用法：wiki ingest <path|url> [--yes] [--agent <id>]');
+          io.err('用法：wiki ingest <path|url> [--yes] [--agent <id>] [--adopt] [--overwrite] [--force]');
           return 2;
         }
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
@@ -139,7 +139,17 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
         const built = !deps.gateway;
         const gateway = deps.gateway ?? buildReasoningBackend(loadConfig(root, env), flags);
         try {
-          const res = await runIngest(input, { vault, gateway }, { io, autoApprove: flags.yes === true });
+          const res = await runIngest(
+            input,
+            { vault, gateway },
+            {
+              io,
+              autoApprove: flags.yes === true,
+              adopt: flags.adopt === true,
+              overwrite: flags.overwrite === true,
+              force: flags.force === true,
+            },
+          );
           return res ? 0 : 0; // 用户取消也是正常退出（exit 0）
         } finally {
           if (built) await gateway.dispose();

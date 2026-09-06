@@ -15,7 +15,7 @@
  * I-i pin 优先；I-k 来源独立性（suggested_source 异源才构成确认）；I-l ingest 不刷新 links.json。
  */
 
-import { readdir } from 'node:fs/promises';
+import { readdir, mkdir, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 
@@ -30,6 +30,10 @@ import { groupRelationsBySlug, mergeRelationMaps } from '../notes/relations';
 import { renderEntityPage, withFrontmatterRelations, extractMention } from '../notes/entity-page';
 import { entityPagePath, kindOfPath, noteTypeFor, ALL_KINDS } from '../notes/kind';
 import { withFrontmatterKind } from '../notes/kind-frontmatter';
+import { withFrontmatterSource } from '../notes/source-fm';
+import { baselineState, contentSha256, readBaselines } from '../vault/baseline';
+import { walkMarkdown } from '../vault/scan';
+import { ValidationError } from '../errors';
 import type { Classification } from '../notes/classify';
 import type { Vault, VaultPlan, ApplyResult, VaultWriteOp } from '../vault/vault';
 import type { ReasoningBackend } from '../reasoning/backend';
@@ -58,6 +62,12 @@ export interface IngestOptions {
   io?: { err(text: string): void };
   /** 【M14】内容短路命中回调（CLI 打印「内容未变更」）；plan 组装后、approve 之前触发（D9） */
   onSkip?: () => void;
+  /** 【M15】忽略短路条件，强制全流程（换模型重抽 / 页丢失后重建） */
+  force?: boolean;
+  /** 【M15】把磁盘现状采纳为基线：冲突不拒绝，直接覆盖并重置基线（存量逃生口，D5） */
+  adopt?: boolean;
+  /** 【M15】忽略基线冲突强制覆盖；被覆盖的旧版快照到 .vault-meta/conflicts/（D6） */
+  overwrite?: boolean;
 }
 
 /** sourceUrl → raw 页文件名（稳定、可移植；去协议/query，非字母数字转 `-`） */
@@ -81,38 +91,111 @@ async function existsRel(vault: Vault, rel: string): Promise<boolean> {
   }
 }
 
-/** I4 去重：扫描 raw/ 找 source_url 命中的页，返回其相对路径（未命中返回 null）。
- * M14 D6 两级匹配：① fm.source_url 字符串全等（规范化值快路径）；
- * ② 把存量页记录的旧形式（相对/file:///、junction 等）规范化后比对 → 存量页收敛到同一 raw 页。 */
-async function findRawBySourceUrl(vault: Vault, sourceUrl: string): Promise<string | null> {
+/** I4 去重 + I25 碰撞检查（一次扫描，D16）：raw/ 下逐页读 frontmatter。
+ * - hit：source_url 两级匹配（M14 D6：① 规范化值全等快路径；② 存量旧形式规范化后比对）命中的既有 raw 页
+ * - occupied：目标文件名（rawRel）已被**其他来源**占用（slug 折叠碰撞，如全中文名折叠后同名） */
+async function scanRaw(
+  vault: Vault,
+  sourceUrl: string,
+  rawRel: string,
+): Promise<{ hit: string | null; occupied: boolean }> {
   const rawDir = path.join(vault.root, 'raw');
   let entries: string[];
   try {
     entries = await readdir(rawDir);
   } catch {
-    return null; // raw/ 不存在 → 无去重目标
+    return { hit: null, occupied: false }; // raw/ 不存在 → 无去重目标也无碰撞
   }
-  for (const f of entries) {
-    if (!f.endsWith('.md')) continue;
+  const mds = entries.filter((f) => f.endsWith('.md'));
+
+  let occupied = false;
+  for (const f of mds) {
     try {
       const fm = parseFrontmatter(await vault.read(`raw/${f}`));
-      if (fm.source_url === sourceUrl) return `raw/${f}`;
-    } catch {
-      /* 跳过损坏/不可读文件 */
-    }
-  }
-  for (const f of entries) {
-    if (!f.endsWith('.md')) continue;
-    try {
-      const fm = parseFrontmatter(await vault.read(`raw/${f}`));
-      if (typeof fm.source_url === 'string' && normalizeSourceUrl(fm.source_url) === sourceUrl) {
-        return `raw/${f}`;
+      if (fm.source_url === sourceUrl) return { hit: `raw/${f}`, occupied };
+      if (`raw/${f}` === rawRel && typeof fm.source_url === 'string' && fm.source_url !== sourceUrl) {
+        occupied = true; // 同名且一级不匹配：可能是碰撞，也可能二级匹配（下一轮排除）
       }
     } catch {
       /* 跳过损坏/不可读文件 */
     }
   }
+  for (const f of mds) {
+    try {
+      const fm = parseFrontmatter(await vault.read(`raw/${f}`));
+      if (typeof fm.source_url === 'string' && normalizeSourceUrl(fm.source_url) === sourceUrl) {
+        return { hit: `raw/${f}`, occupied }; // 二级命中优先于碰撞（同一来源，update 即可）
+      }
+      if (`raw/${f}` === rawRel) occupied = true; // 两级都不匹配的同名文件 = 真碰撞
+    } catch {
+      /* 跳过损坏/不可读文件 */
+    }
+  }
+  return { hit: null, occupied };
+}
+
+/** I27 短路守门：扫 wiki/** 找 frontmatter.raw_source 指向 rawRel 的页。
+ * 找不到（无指针 / 页被删）→ 不短路，全流程重建（D13：删除的正确姿势是删 raw）。
+ * 全扫 wiki/**：页量在千级内可接受；万级再考虑索引化（本里程碑不做）。 */
+async function findWikiByRawSource(vault: Vault, rawRel: string): Promise<string | null> {
+  for (const rel of await walkMarkdown(vault.root, 'wiki')) {
+    try {
+      const fm = parseFrontmatter(await vault.read(rel));
+      if (fm.raw_source === rawRel) return rel;
+    } catch {
+      /* 跳过损坏页 */
+    }
+  }
   return null;
+}
+
+/** M15 C2：对 create/update 目标做基线校验（delete 不查）。总是收集冲突项
+ * （rel + 当前磁盘内容，供 --overwrite 快照）；是否拒绝由调用方决定（I24 整单拒绝）。 */
+async function collectConflicts(
+  vault: Vault,
+  ops: readonly VaultWriteOp[],
+): Promise<{ rel: string; oldContent: string }[]> {
+  const baselines = await readBaselines(vault.root);
+  const out: { rel: string; oldContent: string }[] = [];
+  for (const op of ops) {
+    if (op.operationType === 'delete') continue;
+    let current: string;
+    try {
+      current = await vault.read(op.relativePath);
+    } catch {
+      continue; // 目标不存在 → 'none'（新建，无冲突）
+    }
+    if (baselineState(baselines[op.relativePath], contentSha256(current)) === 'conflict') {
+      out.push({ rel: op.relativePath, oldContent: current });
+    }
+  }
+  return out;
+}
+
+/** M15 D6：--overwrite 场景把被覆盖的旧版旁路快照到 .vault-meta/conflicts/
+ * （不进 VaultWriteOp——assertPortableWritePath 对 .vault-meta 抛 RESERVED_PATH；
+ * 旁路写也保证 approve 拒绝 → 无 apply → 无副本，I3 零写入成立）。 */
+async function snapshotConflicts(
+  vaultRoot: string,
+  conflicts: readonly { rel: string; oldContent: string }[],
+): Promise<void> {
+  if (conflicts.length === 0) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  for (const c of conflicts) {
+    const esc = c.rel.replace(/[\\/]/g, '__');
+    const abs = path.join(vaultRoot, '.vault-meta', 'conflicts', `${esc}.${stamp}.md`);
+    await mkdir(path.dirname(abs), { recursive: true });
+    await writeFile(abs, c.oldContent, 'utf8');
+  }
+}
+
+/** 冲突拒绝信息（I24：整单拒绝，不部分写入） */
+function conflictError(conflicts: readonly { rel: string }[]): ValidationError {
+  return new ValidationError(
+    'WIKI_CONTENT_CONFLICT',
+    `以下页面在系统写出后被外部修改或无基线记录：${conflicts.map((c) => c.rel).join('、')}` +
+      '——加 --adopt 采纳现状，或 --overwrite 覆盖（覆盖前自动快照到 .vault-meta/conflicts/）',
+  );
 }
 
 /* ------------------------------ M13 实体页编排 ------------------------------ */
@@ -461,14 +544,27 @@ export async function ingest(
   meta.sourceSha256 = sha;
   const rawSlug = rawSlugFor(meta.sourceUrl);
   const rawRel = `raw/${rawSlug}.md`;
-  const existingRaw = await findRawBySourceUrl(deps.vault, meta.sourceUrl);
+  const scan = await scanRaw(deps.vault, meta.sourceUrl, rawRel);
+  const existingRaw = scan.hit;
 
-  // M14 C2：内容短路（I17 只看指纹；I19 存量无指纹 → 全流程回填）
+  // M15 I25：目标文件名已被他源占用（slug 折叠碰撞，如全中文名折叠后同名）→ 换名 + 报警，绝不覆盖。
+  // 换名散列取自 source_url 而非 source_sha256——后者是正文指纹，内容一变就换名 → 重复 raw 洪水（D12）。
+  let targetRawRel = rawRel;
+  if (!existingRaw && scan.occupied) {
+    const urlHash = sha256Hex(meta.sourceUrl).slice(0, 8);
+    targetRawRel = `raw/${rawSlug}-${urlHash}.md`;
+    opts?.io?.err(`[RAW_SLUG_COLLISION] ${rawRel} 已被其他来源占用，本次改用 ${targetRawRel}`);
+  }
+
+  // M14 C2 + M15 I27：内容短路。判定 = 指纹相同 且 非 --force 且 指针指向的 wiki 页存在
+  // （无指针/页被删 → 不短路，全流程重建；删除的正确姿势是删 raw，D13）。I19 存量无指纹 → 全流程回填。
   let skipLLM = false;
   if (existingRaw) {
     try {
       const prevFm = parseFrontmatter(await deps.vault.read(existingRaw));
-      skipLLM = typeof prevFm.source_sha256 === 'string' && prevFm.source_sha256 === sha;
+      const sameSha = typeof prevFm.source_sha256 === 'string' && prevFm.source_sha256 === sha;
+      const wikiRel = sameSha && !opts?.force ? await findWikiByRawSource(deps.vault, existingRaw) : null;
+      skipLLM = !opts?.force && sameSha && wikiRel !== null;
     } catch {
       skipLLM = false; // 损坏页 → 不短路
     }
@@ -476,7 +572,7 @@ export async function ingest(
 
   const rawOp: VaultWriteOp = existingRaw
     ? { relativePath: existingRaw, content: renderRawNote(body, meta), operationType: 'update' }
-    : { relativePath: rawRel, content: renderRawNote(body, meta), operationType: 'create' };
+    : { relativePath: targetRawRel, content: renderRawNote(body, meta), operationType: 'create' };
 
   // 2) wiki 页（ai-first，LLM 整理，过反伪造 + lint 闸门；slug 命中已存在 → update）。
   // M14：短路时跳过全部 LLM 与 wiki/实体页写入（I18——wiki 页可能已被手工编辑/毕业）。
@@ -507,7 +603,9 @@ export async function ingest(
 
     // 来源页 frontmatter 写入 relations（relates_to → 各存活实体；幂等注入）
     const wikiRels = relMap.get(wiki!.slug) ?? new Map<string, string[]>();
-    const wikiContent = wikiRels.size > 0 ? withFrontmatterRelations(wiki!.content, wikiRels) : wiki!.content;
+    let wikiContent = wikiRels.size > 0 ? withFrontmatterRelations(wiki!.content, wikiRels) : wiki!.content;
+    // M15 C4/I26：raw_source 指针由代码注入（LLM 填的 source 字段仅作展示，两者并存）
+    wikiContent = withFrontmatterSource(wikiContent, existingRaw ?? targetRawRel);
 
     const wikiRel = `wiki/${wiki!.slug}.md`;
     const wikiExists = await existsRel(deps.vault, wikiRel);
@@ -526,7 +624,7 @@ export async function ingest(
         ...(await planEntityWrite({
           vault: deps.vault,
           gated: c,
-          sourceRel: existingRaw ?? rawRel,
+          sourceRel: existingRaw ?? targetRawRel,
           relMap,
           date: ingestDate,
           wikiSlug: wiki!.slug,
@@ -539,6 +637,14 @@ export async function ingest(
     // 3) raw + wiki + 实体页 同一次事务（operationType=ingest）
     const planFull = await deps.vault.plan([rawOp, wikiOp, ...entityOps]);
     planFull.operationType = 'ingest';
+
+    // M15 C2：写入前基线校验（approve 之前——被拒时根本不到 apply）。
+    // adopt/overwrite = 显式逃生口（跳过拒绝）；overwrite 在 apply 后快照旧版（D6）。
+    const conflicts = await collectConflicts(deps.vault, planFull.writes);
+    if (!opts?.adopt && !opts?.overwrite && conflicts.length > 0) {
+      throw conflictError(conflicts);
+    }
+
     const previewFull = deps.vault.preview(planFull);
 
     // 4) 暂停点：approve 拒绝 → 丢弃，零写入（I3）
@@ -546,10 +652,18 @@ export async function ingest(
     if (!approvedFull) return null;
 
     // 5) 事务原子落盘（任一步失败整体回滚）
-    return deps.vault.apply(planFull, { approvedPlanSha256: previewFull.approvalSha256 });
+    const applied = await deps.vault.apply(planFull, { approvedPlanSha256: previewFull.approvalSha256 });
+    if (opts?.overwrite) {
+      await snapshotConflicts(deps.vault.root, conflicts).catch(() => undefined); // 快照失败不阻断已提交事务
+    }
+    return applied;
   }
 
   // M14 短路路径：仅 raw 页 update（fetched_at 刷新 + 指纹写入/回填），wiki/实体页零触碰（I18）
+  const conflictsSkip = await collectConflicts(deps.vault, [rawOp]);
+  if (!opts?.adopt && !opts?.overwrite && conflictsSkip.length > 0) {
+    throw conflictError(conflictsSkip);
+  }
   const planSkip = await deps.vault.plan([rawOp]);
   planSkip.operationType = 'ingest';
   const previewSkip = deps.vault.preview(planSkip);
@@ -560,5 +674,9 @@ export async function ingest(
   const approvedSkip = opts?.approve ? await opts.approve({ plan: planSkip, preview: previewSkip }) : true;
   if (!approvedSkip) return null;
 
-  return deps.vault.apply(planSkip, { approvedPlanSha256: previewSkip.approvalSha256 });
+  const appliedSkip = await deps.vault.apply(planSkip, { approvedPlanSha256: previewSkip.approvalSha256 });
+  if (opts?.overwrite) {
+    await snapshotConflicts(deps.vault.root, conflictsSkip).catch(() => undefined);
+  }
+  return appliedSkip;
 }
