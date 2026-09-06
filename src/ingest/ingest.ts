@@ -91,14 +91,17 @@ async function existsRel(vault: Vault, rel: string): Promise<boolean> {
   }
 }
 
-/** I4 去重 + I25 碰撞检查（一次扫描，D16）：raw/ 下逐页读 frontmatter。
- * - hit：source_url 两级匹配（M14 D6：① 规范化值全等快路径；② 存量旧形式规范化后比对）命中的既有 raw 页
- * - occupied：目标文件名（rawRel）已被**其他来源**占用（slug 折叠碰撞，如全中文名折叠后同名） */
+/** I4 去重 + I25 碰撞检查 + I30 比对时归一化（单趟扫描，D16/D4）。
+ * - hit：存量 `fm.source_url` 与入参 `sourceUrl` **两侧都过 `normalizeSourceUrl`** 后全等 → 同源（update 即可）
+ * - occupied：目标文件名（rawRel）被**其他来源**占用（slug 折叠碰撞，如全中文名折叠后同名；或匿名 raw）
+ * 归一化使 `file:///C:/x` 与 realpath/junction/相对路径在比对时统一，来源身份单一化（M14 C3）；
+ * 存量 `source_url` 字段值只读不改（I30）。 */
 async function scanRaw(
   vault: Vault,
   sourceUrl: string,
   rawRel: string,
 ): Promise<{ hit: string | null; occupied: boolean }> {
+  const norm = normalizeSourceUrl(sourceUrl);
   const rawDir = path.join(vault.root, 'raw');
   let entries: string[];
   try {
@@ -106,27 +109,14 @@ async function scanRaw(
   } catch {
     return { hit: null, occupied: false }; // raw/ 不存在 → 无去重目标也无碰撞
   }
-  const mds = entries.filter((f) => f.endsWith('.md'));
-
   let occupied = false;
-  for (const f of mds) {
+  for (const f of entries.filter((e) => e.endsWith('.md'))) {
+    const rel = `raw/${f}`;
     try {
-      const fm = parseFrontmatter(await vault.read(`raw/${f}`));
-      if (fm.source_url === sourceUrl) return { hit: `raw/${f}`, occupied };
-      if (`raw/${f}` === rawRel && typeof fm.source_url === 'string' && fm.source_url !== sourceUrl) {
-        occupied = true; // 同名且一级不匹配：可能是碰撞，也可能二级匹配（下一轮排除）
-      }
-    } catch {
-      /* 跳过损坏/不可读文件 */
-    }
-  }
-  for (const f of mds) {
-    try {
-      const fm = parseFrontmatter(await vault.read(`raw/${f}`));
-      if (typeof fm.source_url === 'string' && normalizeSourceUrl(fm.source_url) === sourceUrl) {
-        return { hit: `raw/${f}`, occupied }; // 二级命中优先于碰撞（同一来源，update 即可）
-      }
-      if (`raw/${f}` === rawRel) occupied = true; // 两级都不匹配的同名文件 = 真碰撞
+      const fm = parseFrontmatter(await vault.read(rel));
+      const stored = typeof fm.source_url === 'string' ? normalizeSourceUrl(fm.source_url) : null;
+      if (stored !== null && stored === norm) return { hit: rel, occupied }; // 规范化后全等即同源
+      if (rel === rawRel && stored !== norm) occupied = true; // 同名且非本源（含匿名 raw）→ 碰撞
     } catch {
       /* 跳过损坏/不可读文件 */
     }
@@ -581,13 +571,20 @@ export async function ingest(
   // 2.5) 实体抽取（E1/E2，07 规划 D1/D2）：LLM 提议 + 确定性门 + 分类判定树落地。
   // 抽取回稿不可解析时降级为空（不建词条、不写 relations），不阻断 ingest 主流程（I4）。
   let gated: GateResult = { candidates: [], edges: [] };
+  let extractionFailed = 0;
   if (!skipLLM) {
     try {
       const extraction = await extractEntities(body, meta.sourceUrl, deps.gateway);
       gated = gateCandidates(extraction, body, wiki!.content);
-    } catch {
-      /* 降级：本次无实体页 */
+    } catch (err) {
+      // I28：抽取失败只降级、不阻断、不静默——io.err 必有一行可见
+      extractionFailed++;
+      const msg = err instanceof Error ? err.message : String(err);
+      opts?.io?.err(`[ENTITY_EXTRACT_FAILED] ${meta.sourceUrl}: ${msg}`);
     }
+  }
+  if (extractionFailed > 0) {
+    opts?.io?.err(`[ENTITY_EXTRACT_FAILED] ${extractionFailed} 处实体抽取失败，已降级（本次无实体页）`);
   }
 
   if (!skipLLM) {

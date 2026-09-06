@@ -9,6 +9,7 @@ import { ConfigError, ValidationError } from '../errors';
 import { parseNote } from '../notes/frontmatter';
 import { lintNote } from '../notes/lint';
 import { assertPortableWritePath } from '../vault/paths';
+import { buildSlugIndex } from '../qa/graph';
 import type { ReasoningBackend } from '../reasoning/backend';
 import type { Vault } from '../vault/vault';
 import { diffLines, formatChangedPaths } from './format';
@@ -51,7 +52,23 @@ export async function runEdit(
   deps: EditDeps,
   opts: EditCommandOpts,
 ): Promise<EditResult | null> {
-  const rel = `wiki/${slug}.md`;
+  // F16.2 / I29：slug → 实际 rel 解析（覆盖 M13 起的 wiki/<kind>/ 子目录实体页）。
+  // 优先级：buildSlugIndex（basename / frontmatter.slug / alias）→ 显式相对路径兜底（concepts/vector-db）；
+  // 两者皆空才报 WIKI_PAGE_NOT_FOUND。解析出的 rel 用于读/lint/写三方一致。
+  const index = await buildSlugIndex(deps.vault.root);
+  let rel: string | null = index.get(slug) ?? null;
+  if (!rel) {
+    const explicit = `wiki/${slug}.md`;
+    try {
+      await deps.vault.read(explicit);
+      rel = explicit;
+    } catch {
+      rel = null;
+    }
+  }
+  if (!rel) {
+    throw new ValidationError('WIKI_PAGE_NOT_FOUND', `wiki 页不存在，无法编辑：${slug}`);
+  }
 
   let existing: string;
   try {
