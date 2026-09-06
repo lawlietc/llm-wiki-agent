@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { SafetyError, TransientError, ValidationError } from '../errors';
+import { applyBaseline } from './baseline';
 import { assertPortableWritePath, assertUnaliased, assertWithin } from './paths';
 import type { ApplyResult, VaultPlan } from './vault';
 
@@ -320,6 +321,14 @@ export async function applyBundle(vaultRoot: string, plan: VaultPlan, opts: Appl
       const dirty = path.join(vaultRoot, DIRTY_MARKER_REL);
       await mkdir(path.dirname(dirty), { recursive: true });
       await writeFile(dirty, '', 'utf8');
+
+      // M15 I21：基线记录在**提交之后**旁路写（回滚路径不会走到这里 → 基线不撒谎）。
+      // 失败不阻断：基线是缓存级状态，缺了会落到冲突分支（fail-safe），不该让已提交的事务报错。
+      try {
+        await applyBaseline(vaultRoot, plan.writes);
+      } catch {
+        /* 基线写失败：下次该页判定为冲突，交人裁决 */
+      }
 
       return { operationId: plan.operationId, changedPaths: changed, bundleSha256 };
     } catch (err) {
