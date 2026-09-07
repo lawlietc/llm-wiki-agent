@@ -124,6 +124,29 @@ async function scanRaw(
   return { hit: null, occupied };
 }
 
+/** M17 F17.2：一次性收集 raw/ 下全部来源标识（规范化后），供批量预演判「已有来源页」。
+ * 单次 O(raw 页数) 扫描替代逐项 scanRaw —— 否则预演是 O(n×m)，大批量下不可接受。
+ * 只读，零写入，零 LLM。 */
+export async function collectRawSourceKeys(vault: Vault): Promise<Set<string>> {
+  const keys = new Set<string>();
+  let entries: string[];
+  try {
+    entries = await readdir(path.join(vault.root, 'raw'));
+  } catch {
+    return keys; // raw/ 不存在 → 全新 vault
+  }
+  for (const f of entries) {
+    if (!f.endsWith('.md')) continue;
+    try {
+      const fm = parseFrontmatter(await vault.read(`raw/${f}`));
+      if (typeof fm.source_url === 'string') keys.add(normalizeSourceUrl(fm.source_url));
+    } catch {
+      /* 跳过损坏/不可读文件 */
+    }
+  }
+  return keys;
+}
+
 /** I27 短路守门：扫 wiki/** 找 frontmatter.raw_source 指向 rawRel 的页。
  * 找不到（无指针 / 页被删）→ 不短路，全流程重建（D13：删除的正确姿势是删 raw）。
  * 全扫 wiki/**：页量在千级内可接受；万级再考虑索引化（本里程碑不做）。 */

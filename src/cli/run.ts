@@ -17,7 +17,8 @@ import { resolveVaultRoot } from '../vault/resolve-root';
 import { loadConfig, type LoadedConfig } from './config';
 import type { CliIO } from './io';
 import { runInit } from './init';
-import { runIngest } from './ingest';
+import { runIngest, runIngestBatch } from './ingest';
+import { parseByteSize } from '../ingest/batch';
 import { runAsk } from './ask';
 import { runEdit } from './edit';
 import { runLint } from './lint';
@@ -129,9 +130,17 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
       }
 
       case 'ingest': {
-        const input = positionals[0];
-        if (!input) {
-          io.err('用法：wiki ingest <path|url> [--yes] [--agent <id>] [--adopt] [--overwrite] [--force]');
+        const inputs = positionals;
+        const dir = typeof flags.dir === 'string' ? flags.dir : undefined;
+        const glob = typeof flags.glob === 'string' ? flags.glob : undefined;
+        const fromFile = typeof flags['from-file'] === 'string' ? flags['from-file'] : undefined;
+        const hasBatchSource = Boolean(dir || glob || fromFile);
+        if (inputs.length === 0 && !hasBatchSource) {
+          io.err(
+            '用法：wiki ingest <path|url> [<path|url> ...] [--dir <d>] [--glob <p>] [--from-file <f>]\n' +
+              '                 [--ext md,txt] [--plan] [--max-items N] [--max-bytes 50M]\n' +
+              '                 [--yes] [--agent <id>] [--adopt] [--overwrite] [--force]',
+          );
           return 2;
         }
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
@@ -139,8 +148,53 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
         const built = !deps.gateway;
         const gateway = deps.gateway ?? buildReasoningBackend(loadConfig(root, env), flags);
         try {
+          // M17 F17.8：多输入或显式批量来源 → 批量路径；
+          // 单条位置参数仍走原 runIngest，行为与 M16 完全一致（I32）
+          if (inputs.length > 1 || hasBatchSource) {
+            const maxItemsRaw = flags['max-items'];
+            const maxBytesRaw = flags['max-bytes'];
+            const maxItems = typeof maxItemsRaw === 'string' ? Number(maxItemsRaw) : undefined;
+            const maxBytes = typeof maxBytesRaw === 'string' ? parseByteSize(maxBytesRaw) : undefined;
+            if (maxItems !== undefined && !Number.isFinite(maxItems)) {
+              io.err('--max-items 必须是数字');
+              return 2;
+            }
+            if (maxBytes !== undefined && !Number.isFinite(maxBytes)) {
+              io.err('--max-bytes 必须是体积（如 50M、200KB、1048576）');
+              return 2;
+            }
+            await runIngestBatch(
+              {
+                inputs,
+                dir,
+                glob,
+                fromFile,
+                ext:
+                  typeof flags.ext === 'string'
+                    ? flags.ext
+                        .split(',')
+                        .map((s) => s.trim())
+                        .filter(Boolean)
+                    : undefined,
+              },
+              { vault, gateway },
+              {
+                io,
+                cwd,
+                autoApprove: flags.yes === true,
+                adopt: flags.adopt === true,
+                overwrite: flags.overwrite === true,
+                force: flags.force === true,
+                planOnly: flags.plan === true,
+                maxItems,
+                maxBytes,
+              },
+            );
+            return 0;
+          }
+
           const res = await runIngest(
-            input,
+            inputs[0]!,
             { vault, gateway },
             {
               io,

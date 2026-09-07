@@ -8,6 +8,14 @@
 
 import { ConfigError } from '../errors';
 import { ingest } from '../ingest/ingest';
+import {
+  executeBatch,
+  formatBatchPlan,
+  formatBatchReport,
+  prepareBatch,
+  type BatchReport,
+  type BatchSourceSpec,
+} from '../ingest/batch';
 import type { ReasoningBackend } from '../reasoning/backend';
 import type { Vault } from '../vault/vault';
 import { formatChangedPaths } from './format';
@@ -70,4 +78,75 @@ export async function runIngest(
 
   opts.io.out(`已写入 ${result.changedPaths.length} 个文件：${result.changedPaths.join(', ')}`);
   return { changedPaths: result.changedPaths };
+}
+
+export interface IngestBatchCommandOpts {
+  io: CliIO;
+  autoApprove?: boolean;
+  adopt?: boolean;
+  overwrite?: boolean;
+  force?: boolean;
+  /** --plan：只读预演，零写入零 LLM */
+  planOnly?: boolean;
+  maxItems?: number;
+  maxBytes?: number;
+  /** 相对路径的解析基准（默认 process.cwd()） */
+  cwd?: string;
+}
+
+/**
+ * M17 F17.8：批量 ingest。
+ *
+ * 审批粒度（D3 / I37）：开始前展示预演并确认**一次**，之后每项沿用该决定 ——
+ * 批量下每项一次 approve 不可用。非 TTY 且无 --yes 仍抛 NON_INTERACTIVE（不新开后门）。
+ *
+ * 预演（--plan）在确认之前返回，零写入零 LLM。
+ * @returns 取消或预演返回 null；否则返回聚合报告
+ */
+export async function runIngestBatch(
+  spec: BatchSourceSpec,
+  deps: IngestDeps,
+  opts: IngestBatchCommandOpts,
+): Promise<BatchReport | null> {
+  const io = opts.io;
+
+  const { plan, todos } = await prepareBatch(spec, deps, {
+    io,
+    cwd: opts.cwd,
+    budget: {
+      ...(opts.maxItems !== undefined ? { maxItems: opts.maxItems } : {}),
+      ...(opts.maxBytes !== undefined ? { maxBytes: opts.maxBytes } : {}),
+    },
+  });
+
+  io.out(formatBatchPlan(plan));
+
+  if (opts.planOnly) return null;
+  if (todos.length === 0) {
+    io.out('没有需要处理的来源。');
+    return null;
+  }
+
+  let approved = opts.autoApprove === true;
+  if (!approved) {
+    if (!io.isTTY) {
+      throw new ConfigError('NON_INTERACTIVE', '非交互环境无法确认变更，请加 --yes 以自动批准');
+    }
+    approved = await io.confirm(`确认处理以上 ${todos.length} 个来源？(y/N) `);
+  }
+  if (!approved) {
+    io.out('已取消，未处理任何来源。');
+    return null;
+  }
+
+  const report = await executeBatch(todos, deps, {
+    io,
+    force: opts.force,
+    adopt: opts.adopt,
+    overwrite: opts.overwrite,
+    autoApprove: true, // I37：已一次性确认，逐项沿用
+  });
+
+  io.out(formatBatchReport(report));
+  return report;
 }
