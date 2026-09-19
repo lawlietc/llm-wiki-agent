@@ -130,7 +130,8 @@ describe('F14.3 ingest 内容短路', () => {
     const content = await tv.read(rawRel);
     await tv.write(rawRel, content.replace(/^source_sha256: .*\n/m, ''));
 
-    const r2 = await ingest(fileA, { vault, gateway: gw });
+    // M15 D5：存量页无基线，首次重跑走 --adopt 采纳现状为基线（而非被 WIKI_CONTENT_CONFLICT 拒绝）
+    const r2 = await ingest(fileA, { vault, gateway: gw }, { adopt: true });
     expect(gw.calls).toHaveLength(4); // 不短路：全流程
     const fm = parseNote(await tv.read(rawRel)).frontmatter;
     expect(fm.source_sha256).toMatch(/^[0-9a-f]{64}$/); // 回填
@@ -180,7 +181,8 @@ describe('F14.3 ingest 内容短路', () => {
     await tv.write('raw/legacy-form.md', legacy);
 
     const gw = gwFor();
-    const r = await ingest(fileA, { vault, gateway: gw });
+    // M15 D5：存量无基线的 legacy 页，首次重跑走 --adopt 采纳现状（而非被冲突拒绝）
+    const r = await ingest(fileA, { vault, gateway: gw }, { adopt: true });
 
     // 收敛：更新 legacy 页而非新建（raw 目录仍 1 页）
     expect(await rawRels(tv)).toEqual(['raw/legacy-form.md']);

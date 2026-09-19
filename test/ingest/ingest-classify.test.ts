@@ -13,6 +13,7 @@ import { ingest } from '../../src/ingest/ingest';
 import { createVault } from '../../src/vault/vault';
 import { resolveLinks } from '../../src/vault/links';
 import { parseNote } from '../../src/notes/frontmatter';
+import { readSourceRefs } from '../../src/notes/source-fm';
 import { _classifySeam } from '../../src/notes/classify';
 import { makeVault, type TempVault } from '../../test/helpers/make-vault';
 import { FakeGateway } from '../../test/fakes/fake-gateway';
@@ -211,7 +212,8 @@ describe('F13.4 建页与毕业', () => {
       '---\ntype: idea\ndate: 2026-09-01\nslug: pinpage\ntitle: Pin Page Subject\nentity_kind: person\nneeds_classification: true\n---\n\n## For future agent\n\n人工 pin 页\n',
     );
     const io: FakeCliIO = fakeCliIO();
-    await ingest(fileA, { vault, gateway: gwFor(EXTRACT_A) }, { io });
+    // adopt：预置 pin 页无基线记录（M15 D3 存量语义），采纳现状后测 pin 行为
+    await ingest(fileA, { vault, gateway: gwFor(EXTRACT_A) }, { io, adopt: true });
 
     expect(io.errLines.some((l) => l.includes('[KIND_PIN_CONFLICT]'))).toBe(true);
     expect(tv.exists('wiki/projects/pinpage.md')).toBe(false);
@@ -293,7 +295,8 @@ describe('F13.4 建页与毕业', () => {
       'wiki/topic-page.md',
       '---\ntype: project\ndate: 2026-09-01\nai-first: true\nconfidence: high\nslug: topic-page\n---\n\n## For future agent\n\n提到 [[zenithflow]]。\n',
     );
-    await ingest(fileA, { vault, gateway: gwFor(EXTRACT_A) });
+    // adopt：预置页无基线（M15 存量语义同步）
+    await ingest(fileA, { vault, gateway: gwFor(EXTRACT_A) }, { adopt: true });
     await ingest(fileB, { vault, gateway: gwFor(EXTRACT_B) });
 
     expect(tv.exists('wiki/projects/zenithflow.md')).toBe(true);
@@ -356,7 +359,12 @@ describe('F13.4 建页与毕业', () => {
     const { frontmatter } = parseNote(after);
     expect(frontmatter.suggested_kind).toBe('project');
     expect(String(frontmatter.suggested_source)).toContain('article-a');
-    expect(after).toBe(before); // 内容零变化
+    // 票级保险② 的真实不变量：**建议值与正文**不变。
+    // M20 工单 03 之后唯一允许的变化是代码掌管的溯源指针并集——第二篇文档也提到了
+    // 这个实体，页面必须记得它（I47 已按裁决收窄为「frontmatter 允许增减溯源键」）。
+    const stripRefs = (s: string) => s.replace(/^source_refs: .*\n/m, '').replace(/^raw_source: .*\n/m, '');
+    expect(stripRefs(after)).toBe(stripRefs(before));
+    expect(readSourceRefs(frontmatter as unknown as Record<string, unknown>)).toHaveLength(2);
   });
 
   it('T13.4-15 三拍毕业路径：named（建页无建议）→ discussed（写建议）→ discussed（一致）→ 毕业', async () => {

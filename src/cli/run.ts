@@ -19,10 +19,12 @@ import type { CliIO } from './io';
 import { runInit } from './init';
 import { runIngest, runIngestBatch } from './ingest';
 import { parseByteSize } from '../ingest/batch';
+import { GRANULARITIES, EXTRACT_MODES, isGranularity, isExtractMode, type ExtractMode, type Granularity } from '../ingest/extract';
 import { runAsk } from './ask';
 import { runEdit } from './edit';
 import { runLint } from './lint';
 import { runLink } from './link';
+import { runRetract } from './retract';
 import { runStatus } from './status';
 import { runIndexRebuild } from './index-rebuild';
 
@@ -113,7 +115,7 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
   const io = deps.io;
 
   if (argv.length === 0) {
-    io.err('用法：wiki <init|ingest|ask|edit|lint|link|index|status> [...]');
+    io.err('用法：wiki <init|ingest|ask|edit|lint|link|retract|index|status> [...]');
     return 2;
   }
 
@@ -138,11 +140,27 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
         if (inputs.length === 0 && !hasBatchSource) {
           io.err(
             '用法：wiki ingest <path|url> [<path|url> ...] [--dir <d>] [--glob <p>] [--from-file <f>]\n' +
-              '                 [--ext md,txt] [--plan] [--max-items N] [--max-bytes 50M]\n' +
+              '                 [--ext md,txt] [--plan] [--json] [--max-items N] [--max-bytes 50M]\n' +
+              '                 [--granularity focused|standard|exhaustive]\n' +
+              '                 [--extract-mode single|cited]\n' +
               '                 [--yes] [--agent <id>] [--adopt] [--overwrite] [--force]',
           );
           return 2;
         }
+        // M20 工单 01：粒度档位在花钱之前校验——未知档位明确报错，绝不静默回落
+        const granularityRaw = flags.granularity;
+        if (granularityRaw !== undefined && !isGranularity(granularityRaw)) {
+          io.err(`--granularity 只接受 ${GRANULARITIES.join('|')}，收到：${String(granularityRaw)}`);
+          return 2;
+        }
+        const granularity: Granularity | undefined = granularityRaw;
+        // M20 工单 04：抽取模式同样在花钱之前校验（未知模式零 LLM 退出）
+        const extractModeRaw = flags['extract-mode'];
+        if (extractModeRaw !== undefined && !isExtractMode(extractModeRaw)) {
+          io.err(`--extract-mode 只接受 ${EXTRACT_MODES.join('|')}，收到：${String(extractModeRaw)}`);
+          return 2;
+        }
+        const extractMode: ExtractMode | undefined = extractModeRaw;
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
         const vault: Vault = createVault(root);
         const built = !deps.gateway;
@@ -186,6 +204,9 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
                 overwrite: flags.overwrite === true,
                 force: flags.force === true,
                 planOnly: flags.plan === true,
+                json: flags.json === true,
+                granularity,
+                extractMode,
                 maxItems,
                 maxBytes,
               },
@@ -202,6 +223,8 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
               adopt: flags.adopt === true,
               overwrite: flags.overwrite === true,
               force: flags.force === true,
+              granularity,
+              extractMode,
             },
           );
           return res ? 0 : 0; // 用户取消也是正常退出（exit 0）
@@ -259,6 +282,23 @@ export async function runCli(argv: string[], deps: RunDeps): Promise<number> {
         const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
         const r = await runLink({ vaultRoot: root }, { io, fix: flags.fix === true });
         return r.exitCode;
+      }
+
+      case 'retract': {
+        // M20 工单 07：源回收。**零 LLM** —— 不构建推理后端（没有 token 成本可言）
+        const source = positionals[0];
+        if (!source) {
+          io.err('用法：wiki retract <raw 相对路径|wiki 主页 slug> [--plan] [--json] [--yes]');
+          return 2;
+        }
+        const root = deps.vaultRoot ?? resolveVaultRoot({ explicit: flags.vault as string, env, cwd }).root;
+        await runRetract(source, { vault: createVault(root) }, {
+          io,
+          autoApprove: flags.yes === true,
+          planOnly: flags.plan === true,
+          json: flags.json === true,
+        });
+        return 0;
       }
 
       case 'index': {

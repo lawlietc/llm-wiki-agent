@@ -38,6 +38,12 @@ export interface EntityPageInput {
   relations?: Map<string, string[]>;
   /** Mentions 溯源：原文摘录 + 来源 wiki 页 slug */
   mention?: { quote: string; wikiSlug: string };
+  /**
+   * 【M20 工单 06】Mentions 溯源（多条）。
+   * 跨源归并时同一实体由多篇源共同支撑，每源的摘录都要留痕（详见 `mention` 的兼容形态）。
+   * 提供本字段时以它为准。
+   */
+  mentions?: { quote: string; wikiSlug: string }[];
 }
 
 /** relations Map → frontmatter 值对象（Record<type, ['[[x]]']>） */
@@ -82,12 +88,16 @@ export function renderEntityPage(input: EntityPageInput): string {
   }
 
   const summary = input.summary && input.summary.trim() !== '' ? input.summary.trim() : '（待补全）';
-  const srcRef = input.mention ? `，来源见 [[${input.mention.wikiSlug}]]` : '';
+  // Mentions：单条（mention）与多条（mentions）两种形态；单条时输出与既有逐字一致
+  const mentions = input.mentions ?? (input.mention ? [input.mention] : []);
+  const srcRef = mentions.length > 0 ? `，来源见 [[${mentions[0]!.wikiSlug}]]` : '';
+  const mentionsSection =
+    mentions.length > 0
+      ? `\n## Mentions\n\n${mentions.map((m) => `> "${m.quote}" — [[${m.wikiSlug}]]`).join('\n\n')}\n`
+      : '';
   const body = isStub
     ? `本页是实体「${input.name}」的占位词条（stub），由 ingest 实体抽取或死链占位自动建立，待后续补全${srcRef}。\n\n## 摘要\n\n${summary}\n`
-    : `本页描述实体「${input.name}」，由 ingest 实体抽取自动生成${srcRef}。\n\n## 摘要\n\n${summary}\n${
-        input.mention ? `\n## Mentions\n\n> "${input.mention.quote}" — [[${input.mention.wikiSlug}]]\n` : ''
-      }`;
+    : `本页描述实体「${input.name}」，由 ingest 实体抽取自动生成${srcRef}。\n\n## 摘要\n\n${summary}\n${mentionsSection}`;
 
   return `---\n${renderFrontmatter(fm)}\n---\n\n## For future agent\n\n${body}`;
 }

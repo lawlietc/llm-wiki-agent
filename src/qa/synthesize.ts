@@ -6,6 +6,7 @@
  */
 
 import { ValidationError } from '../errors';
+import { isSourceAnchor } from '../notes/source-anchor';
 import type { ReasoningBackend } from '../reasoning/backend';
 
 /** 综合层硬规则（06 §2.1，逐字采用；快照断言见 T5.4-01） */
@@ -115,6 +116,9 @@ function normalizeCitation(c: string): string | null {
 
 /**
  * citations 校验 + 引用归属（M12 D11/I14）：
+ * - **源片段锚点**（M20 工单 05，`[src:<源页>#chunk-N]`）→ 不是页级引用：从 citations
+ *   剔除并计数（调用方落 gaps 说明）。实体页正文带源锚点后模型可能照抄，
+ *   必须**显式**区分，绝不能被 `anchorSlug` 解析出一个假 slug（也不静默吞掉）；
  * - 形态非法（修复不了）→ 硬失败 CITATION_FORMAT（T5.4-06 语义：真正非法的形态仍拒绝）；
  * - 形态合法但页级 slug 不在 pages 白名单（<graph> 带来的邻居被引用）→ **软降级**：
  *   从 citations 剔除并记录（由调用方落 gaps 说明），不改 answer、不抛错。
@@ -122,16 +126,21 @@ function normalizeCitation(c: string): string | null {
 function validateCitations(
   raw: unknown,
   whitelist: ReadonlySet<string>,
-): { citations: string[]; droppedSlugs: string[] } {
+): { citations: string[]; droppedSlugs: string[]; sourceAnchors: string[] } {
   if (!Array.isArray(raw)) {
     throw new ValidationError('SYNTHESIS_BAD_CITATIONS', 'citations 须为数组');
   }
   const seen = new Set<string>();
   const dropped = new Set<string>();
+  const sourceAnchors = new Set<string>();
   const out: string[] = [];
   for (const c of raw) {
     if (typeof c !== 'string') {
       throw new ValidationError('CITATION_FORMAT', `非法引用锚点：${String(c)}`);
+    }
+    if (isSourceAnchor(c)) {
+      sourceAnchors.add(c.trim());
+      continue;
     }
     const fixed = normalizeCitation(c);
     if (fixed == null) {
@@ -146,7 +155,11 @@ function validateCitations(
       out.push(fixed);
     }
   }
-  return { citations: out, droppedSlugs: [...dropped].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)) };
+  return {
+    citations: out,
+    droppedSlugs: [...dropped].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    sourceAnchors: [...sourceAnchors].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+  };
 }
 
 /**
@@ -182,16 +195,22 @@ export async function synthesize(
     throw new ValidationError('SYNTHESIS_BAD_JSON', 'answer 须为字符串');
   }
 
-  const { citations, droppedSlugs } = validateCitations(
+  const { citations, droppedSlugs, sourceAnchors } = validateCitations(
     parsed.citations,
     new Set(ctx.pages.map((p) => p.slug)),
   );
   const parsedGaps = Array.isArray(parsed.gaps) ? parsed.gaps.filter((g) => typeof g === 'string') : [];
   // D11：被剥的越界引用落 gaps 说明（不静默），answer 文本不改写
-  const gaps =
-    droppedSlugs.length > 0
-      ? [...parsedGaps, `引用了未提供正文的页（已从 citations 剔除）：${droppedSlugs.join(', ')}`]
-      : parsedGaps;
+  const gaps = [
+    ...parsedGaps,
+    ...(droppedSlugs.length > 0
+      ? [`引用了未提供正文的页（已从 citations 剔除）：${droppedSlugs.join(', ')}`]
+      : []),
+    // M20 工单 05：源片段锚点不是页级引用——剔除但说明（实体页正文带锚点后模型可能照抄）
+    ...(sourceAnchors.length > 0
+      ? [`引用了源片段锚点（非页级引用，已从 citations 剔除）：${sourceAnchors.join(', ')}`]
+      : []),
+  ];
 
   return { answer: parsed.answer, citations, gaps };
 }

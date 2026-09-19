@@ -18,9 +18,19 @@ import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { ConfigError, SafetyError } from '../errors';
+import { ConfigError } from '../errors';
+import { isMustAbort } from './abort';
 import { SKIP_DIRS } from '../vault/scan';
-import { collectRawSourceKeys, ingest, type IngestDeps } from './ingest';
+import {
+  collectRawSourceKeys,
+  commitIngest,
+  prepareIngest,
+  type IngestDeps,
+  type IngestOverride,
+  type PreparedIngest,
+} from './ingest';
+import { reduceEntityMerges, relMapForOwner, type MergeContribution, type KindMergeConflict } from './merge';
+import { DEFAULT_GRANULARITY, DEFAULT_EXTRACT_MODE, type ExtractMode, type Granularity } from './extract';
 import { normalizeSourceUrl } from './source-url';
 import type { VaultPlan } from '../vault/vault';
 
@@ -118,6 +128,14 @@ export interface BatchReport {
   changedPaths: string[];
   items: BatchItemResult[];
   elapsedMs: number;
+  /** 【M20】本批使用的抽取粒度（整批共用一个档位，工单 01） */
+  granularity: Granularity;
+  /** 【M20】本批使用的抽取模式（整批共用一个模式，工单 04） */
+  extractMode: ExtractMode;
+  /** 【M20 工单 06】跨源归并：被折叠的重复贡献总数（= 省下的实体页写操作数） */
+  merged: number;
+  /** 【M20 工单 06】同 slug 不同 kind 的类型冲突（保留先出现者，逐条记录，不静默丢弃） */
+  kindConflicts: KindMergeConflict[];
 }
 
 export interface BatchOptions {
@@ -127,29 +145,22 @@ export interface BatchOptions {
   adopt?: boolean;
   overwrite?: boolean;
   budget?: Partial<BatchBudget>;
+  /** 【M20】抽取粒度：整批共用（工单 01）；缺省 standard = 与 M17 逐字一致 */
+  granularity?: Granularity;
+  /** 【M20】抽取模式：整批共用（工单 04）；缺省 single = 与 M19 逐字一致 */
+  extractMode?: ExtractMode;
 }
 
-// ── I35 must-abort 分类 ────────────────────────────────────────────
+// ── I35 must-abort 分类（实现在 ./abort，与 ingest 抽取层共用同一分类器）──
 
-const MUST_ABORT_CODES = new Set([
-  'NON_INTERACTIVE',
-  'UNSUPPORTED_PLATFORM',
-  'BATCH_BUDGET_EXCEEDED',
-  'BATCH_NO_INPUT',
-]);
+export { MUST_ABORT_CODES, isMustAbort } from './abort';
 
-/**
- * 是否属于「继续也无意义」的错误 → 整批停机（I35）。
- * ConfigError（配置/凭证/NON_INTERACTIVE）与 SafetyError（平台/越界，fail-closed）
- * 整类必停；其余（LLM 失败、lint、WIKI_CONTENT_CONFLICT）按 I34 逐项容错继续。
- */
-export function isMustAbort(err: unknown): boolean {
-  if (err instanceof ConfigError || err instanceof SafetyError) return true;
-  if (err && typeof err === 'object' && 'code' in err) {
-    const code = (err as { code?: unknown }).code;
-    if (typeof code === 'string' && MUST_ABORT_CODES.has(code)) return true;
-  }
-  return false;
+/** 错误 → 报告用的 {code, message}（非 Error / 无 code 时退化为空码） */
+function errInfo(err: unknown): { code: string; message: string } {
+  const message = err instanceof Error ? err.message : String(err);
+  const code =
+    err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : '';
+  return { code, message };
 }
 
 // ── F17.1 输入枚举 ──────────────────────────────────────────────────
@@ -398,11 +409,11 @@ export async function prepareBatch(
 // ── F17.5–F17.7 执行：顺序、隔离、报告 ───────────────────────────────
 
 /**
- * 顺序执行（I39）。逐项 try/catch：可容错的错误计入报告继续（I34），
- * must-abort 类直接上抛整批停机（I35）。
+ * M20 工单 06：批量改成**两相位**——先把整批的抽取产出收齐（零写入），
+ * 按 slug **串行 reduce** 归并（同一实体只落一次），再**逐项事务提交**。
  *
- * approve 回调在这里还有第二个用途：读取 plan.writes 统计 create/update，
- * 供聚合报告使用（不需要额外扫盘）。
+ * 红线未破：写侧不并发（I44）、逐项走基线与冲突检查（M15 I24）、逐项失败隔离（I34）、
+ * must-abort 整批停机（I35）、`--plan` 仍零 LLM（合并数只进 `--json` 报告，不进预演）。
  */
 export async function executeBatch(
   todos: BatchInput[],
@@ -411,25 +422,108 @@ export async function executeBatch(
 ): Promise<BatchReport> {
   const started = Date.now();
   const io = opts.io;
-  const items: BatchItemResult[] = [];
-  const changedPaths: string[] = [];
-  let ingested = 0;
-  let skippedShortcut = 0;
+  const granularity = opts.granularity ?? DEFAULT_GRANULARITY;
+  const extractMode = opts.extractMode ?? DEFAULT_EXTRACT_MODE;
+  const itemIo = io ? { err: (text: string) => io.err(text) } : undefined;
+
+  // ── 相位 A：准备（全部 LLM 发生在这里；零写入；逐项失败隔离 I34）────────────
   let skippedDuplicate = 0;
-  let conflicts = 0;
-  let failed = 0;
-  let created = 0;
-  let updated = 0;
+  const slots: {
+    item: BatchInput;
+    duplicate: boolean;
+    prepared: PreparedIngest | null;
+    failure?: { code: string; message: string };
+  }[] = [];
   const seen = new Set<string>();
+  /** 批内 I25：已登记的 raw 落点（两相位下各项看不到同批他项的写入，需显式预留） */
+  const reservedRawRels = new Set<string>();
+  /**
+   * I35 停机**延后到相位 C**：两相位下必须先把已备好的项落盘，再抛停机错误——
+   * 这与顺序执行的对外语义一致（「停机前已完成的保留」），却不违背「先收齐再提交」。
+   */
+  let deferredAbort: { index: number; err: unknown } | null = null;
 
   for (let i = 0; i < todos.length; i++) {
     const item = todos[i]!;
 
-    // I33 二次去重（executeBatch 可能被独立调用）
+    // I33 二次去重（executeBatch 可能被独立调用）：零 LLM 剔除
     if (seen.has(item.dedupKey)) {
+      slots.push({ item, duplicate: true, prepared: null });
+      continue;
+    }
+    seen.add(item.dedupKey);
+
+    io?.out(`[${i + 1}/${todos.length}] ${item.input}`);
+    try {
+      const prepared = await prepareIngest(item.input, deps, {
+        io: itemIo,
+        force: opts.force,
+        adopt: opts.adopt,
+        overwrite: opts.overwrite,
+        granularity,
+        extractMode,
+        reservedRawRels,
+      });
+      reservedRawRels.add(prepared.sourceRel);
+      slots.push({ item, duplicate: false, prepared });
+    } catch (err) {
+      if (isMustAbort(err)) {
+        // 占位槽位必须留下：相位 C 走到它时才抛，之前的项因此来得及落盘
+        slots.push({ item, duplicate: false, prepared: null, failure: errInfo(err) });
+        deferredAbort = { index: slots.length - 1, err };
+        break; // 不再为后续项花钱（继续也无意义）；已备好的项仍会落盘
+      }
+      slots.push({ item, duplicate: false, prepared: null, failure: errInfo(err) });
+    }
+  }
+
+  // ── 相位 B：串行 reduce 归并（I44：此处不写盘、不并发）────────────────────
+  const contributions: MergeContribution[] = [];
+  for (let i = 0; i < slots.length; i++) {
+    const p = slots[i]!.prepared;
+    if (p === null) continue;
+    for (const c of p.candidates) {
+      contributions.push({
+        index: i,
+        input: slots[i]!.item.input,
+        sourceRel: p.sourceRel,
+        wikiSlug: p.wikiSlug ?? '',
+        body: p.body,
+        relMap: p.relMap,
+        gated: c.gated,
+        ...(c.contradictions !== undefined ? { contradictions: c.contradictions } : {}),
+      });
+    }
+  }
+  const mergeResult = reduceEntityMerges(contributions);
+  for (const kc of mergeResult.kindConflicts) {
+    // 不静默丢弃：类型冲突逐条可见（保留先出现者）
+    io?.err(
+      `[KIND_MERGE_CONFLICT] ${kc.slug}：${kc.keptInput} 判 ${String(kc.keptKind)} 与 ${kc.droppedInput} 判 ${String(kc.droppedKind)} 冲突，保留先出现者`,
+    );
+  }
+
+  // ── 相位 C：逐项事务提交（宿主项带上归并后的合并视图）──────────────────────
+  const items: BatchItemResult[] = [];
+  const changedPaths: string[] = [];
+  let ingested = 0;
+  let skippedShortcut = 0;
+  let conflicts = 0;
+  let failed = 0;
+  let created = 0;
+  let updated = 0;
+
+  for (let i = 0; i < slots.length; i++) {
+    const slot = slots[i]!;
+    const input = slot.item.input;
+
+    // I35：相位 A 判定停机的那一项 —— 先把它之前的项落完盘，再抛（顺序执行的等价语义）
+    if (deferredAbort !== null && i === deferredAbort.index) throw deferredAbort.err;
+
+    if (slot.duplicate) {
       skippedDuplicate += 1;
       items.push({
-        input: item.input,
+        input,
         status: 'skipped-duplicate',
         changedPaths: [],
         created: 0,
@@ -438,35 +532,67 @@ export async function executeBatch(
       });
       continue;
     }
-    seen.add(item.dedupKey);
 
-    io?.out(`[${i + 1}/${todos.length}] ${item.input}`);
+    if (slot.prepared === null) {
+      failed += 1;
+      const code = slot.failure?.code ?? '';
+      io?.err(`  ✗ ${input} — ${code ? `[${code}] ` : ''}${slot.failure?.message ?? ''}`);
+      items.push({
+        input,
+        status: 'failed',
+        changedPaths: [],
+        created: 0,
+        updated: 0,
+        reason: slot.failure?.message ?? '',
+      });
+      continue;
+    }
+
+    // 归并后该项只写「自己是宿主」的实体（跨源重复贡献已折叠）
+    const owned = mergeResult.byIndex.get(i) ?? [];
+    const override: IngestOverride = {
+      candidates: owned.map((m) => ({
+        slug: m.slug,
+        gated: m.gated,
+        sourceRels: m.sourceRels,
+        extraMentions: m.extraMentions,
+        ...(m.contradictions.length > 0 ? { contradictions: m.contradictions } : {}),
+      })),
+      relMap: relMapForOwner(slot.prepared.relMap, owned),
+    };
 
     let itemCreated = 0;
     let itemUpdated = 0;
     let shortCircuited = false;
 
     try {
-      const res = await ingest(item.input, deps, {
-        io: io ? { err: (text: string) => io.err(text) } : undefined,
-        force: opts.force,
-        adopt: opts.adopt,
-        overwrite: opts.overwrite,
-        onSkip: () => {
-          shortCircuited = true;
+      const res = await commitIngest(
+        slot.prepared,
+        deps,
+        {
+          io: itemIo,
+          force: opts.force,
+          adopt: opts.adopt,
+          overwrite: opts.overwrite,
+          granularity,
+          extractMode,
+          onSkip: () => {
+            shortCircuited = true;
+          },
+          approve: async (ctx: { plan: VaultPlan }) => {
+            itemCreated = ctx.plan.writes.filter((w) => w.operationType === 'create').length;
+            itemUpdated = ctx.plan.writes.filter((w) => w.operationType === 'update').length;
+            return opts.autoApprove;
+          },
         },
-        approve: async (ctx: { plan: VaultPlan }) => {
-          itemCreated = ctx.plan.writes.filter((w) => w.operationType === 'create').length;
-          itemUpdated = ctx.plan.writes.filter((w) => w.operationType === 'update').length;
-          return opts.autoApprove;
-        },
-      });
+        override,
+      );
 
       if (!res) {
         // 批量下已一次性确认，走到这里说明该项未被批准 → 按失败计，零写入
         failed += 1;
         items.push({
-          input: item.input,
+          input,
           status: 'failed',
           changedPaths: [],
           created: 0,
@@ -482,7 +608,7 @@ export async function executeBatch(
         // M14 短路：只刷新 raw 元数据，不计入新建/更新（保持报告语义干净）
         skippedShortcut += 1;
         items.push({
-          input: item.input,
+          input,
           status: 'skipped-shortcut',
           changedPaths: res.changedPaths,
           created: 0,
@@ -494,7 +620,7 @@ export async function executeBatch(
         created += itemCreated;
         updated += itemUpdated;
         items.push({
-          input: item.input,
+          input,
           status: 'ingested',
           changedPaths: res.changedPaths,
           created: itemCreated,
@@ -504,14 +630,13 @@ export async function executeBatch(
     } catch (err) {
       if (isMustAbort(err)) throw err; // I35：整批停机
       const message = err instanceof Error ? err.message : String(err);
-      const code =
-        err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : '';
+      const code = errInfo(err).code;
       const isConflict = code === 'WIKI_CONTENT_CONFLICT';
       if (isConflict) conflicts += 1;
       else failed += 1;
-      io?.err(`  ✗ ${item.input} — ${code ? `[${code}] ` : ''}${message}`);
+      io?.err(`  ✗ ${input} — ${code ? `[${code}] ` : ''}${message}`);
       items.push({
-        input: item.input,
+        input,
         status: isConflict ? 'conflict' : 'failed',
         changedPaths: [],
         created: 0,
@@ -533,6 +658,10 @@ export async function executeBatch(
     changedPaths,
     items,
     elapsedMs: Date.now() - started,
+    granularity,
+    extractMode,
+    merged: mergeResult.merged,
+    kindConflicts: mergeResult.kindConflicts,
   };
 }
 
@@ -555,15 +684,21 @@ export function formatBatchPlan(plan: BatchPlan): string {
 
 export function formatBatchReport(report: BatchReport): string {
   const lines = [
-    `批量 ingest 完成（${report.total} 个来源）`,
+    `批量 ingest 完成（${report.total} 个来源，抽取粒度 ${report.granularity}，抽取模式 ${report.extractMode}）`,
     `  已处理            ${report.ingested}`,
     `  新建              ${report.created}`,
     `  更新              ${report.updated}`,
     `  跳过（内容未变更） ${report.skippedShortcut}`,
     `  剔除（批内重复）   ${report.skippedDuplicate}`,
+    `  跨源归并          ${report.merged}   ← 同 slug 的重复贡献被折叠进同一实体页`,
     `  冲突（未写入）     ${report.conflicts}`,
     `  失败              ${report.failed}`,
   ];
+  for (const kc of report.kindConflicts) {
+    lines.push(
+      `  ! 类型冲突 ${kc.slug}：保留 ${kc.keptInput} 判的 ${String(kc.keptKind)}（${kc.droppedInput} 判 ${String(kc.droppedKind)}）`,
+    );
+  }
   for (const it of report.items) {
     if (it.status === 'failed' || it.status === 'conflict') {
       lines.push(`    ✗ ${it.input} — ${it.reason ?? it.status}`);

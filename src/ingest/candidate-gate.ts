@@ -30,6 +30,26 @@ export const ENTITY_KINDS: ReadonlySet<string> = new Set<EntityKind>([
 
 export type Coverage = 'defined' | 'discussed' | 'named';
 
+/**
+ * 【M20 工单 04】引用式抽取产出的「事实」：**逐字取自原文片段**的一小段。
+ *
+ * 由代码从被引用的 chunk 组装（模型只负责「哪个实体出现在哪一段」，不负责改写），
+ * 故事实永不含模型转述（I42 的字面命中门控在 `extract.ts` 的 reduce 前完成）。
+ */
+export interface FactRef {
+  /** 逐字原文片段（未改写） */
+  text: string;
+  /** 片段在本次正文分块中的序号（0 起；`chunkPage` 的稳定编号） */
+  chunkIndex: number;
+  /**
+   * 【M20 工单 06】该事实所属的源（raw 页相对路径）。
+   * 由编排层在抽取后盖章（抽取层不知道 raw 落点）；跨源归并后用于把事实
+   * 按源分组落回各自的分块编号空间——否则贡献源的事实会被记到宿主源的块号下，
+   * 锚点指向错误的原文。
+   */
+  sourceRef?: string;
+}
+
 /** 抽取器提名的实体候选（M10.3 解析后的原始形态） */
 export interface EntityCandidate {
   name: string;
@@ -39,6 +59,8 @@ export interface EntityCandidate {
   /** 抽取自身产出的一句话摘要（stub 内容来源，不额外调 LLM） */
   summary?: string;
   aliases?: string[];
+  /** 【M20 工单 04】引用式抽取的原文事实（single 模式不产生；工单 05 起落进页面锚点） */
+  facts?: FactRef[];
 }
 
 /** 原始边（type 尚未校验） */
@@ -211,6 +233,22 @@ export function countProseOccurrences(body: string, name: string, aliases?: stri
   return best;
 }
 
+/** 解析引用式抽取回传的事实数组（畸形项剪除；工单 04 起才有，single 模式恒空） */
+function parseFacts(value: unknown): FactRef[] {
+  if (!Array.isArray(value)) return [];
+  const out: FactRef[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+    const o = item as Record<string, unknown>;
+    const text = typeof o.text === 'string' ? o.text.trim() : '';
+    const chunkIndex = typeof o.chunkIndex === 'number' && Number.isInteger(o.chunkIndex) ? o.chunkIndex : -1;
+    if (text === '' || chunkIndex < 0) continue;
+    const sourceRef = typeof o.sourceRef === 'string' && o.sourceRef.trim() !== '' ? o.sourceRef.trim() : undefined;
+    out.push(sourceRef === undefined ? { text, chunkIndex } : { text, chunkIndex, sourceRef });
+  }
+  return out;
+}
+
 /* ------------------------------ 门入口 ------------------------------ */
 
 /**
@@ -249,6 +287,14 @@ export function gateCandidates(
       : [];
     const summary = typeof o.summary === 'string' && o.summary.trim() !== '' ? o.summary.trim() : undefined;
     const slug = typeof o.slug === 'string' ? o.slug.trim() : '';
+    const facts = parseFacts(o.facts); // 工单 04：引用式事实随候选穿过门（无则不带键，保持既有形状）
+
+    /** 组装候选（facts 仅在有内容时挂上，避免扰动既有 deep-equal 断言） */
+    const mkCandidate = (): EntityCandidate => {
+      const c: EntityCandidate = { name, slug, kind, coverage, summary, aliases };
+      if (facts.length > 0) c.facts = facts;
+      return c;
+    };
 
     const { location } = classifyCandidate(body, name, aliases);
     const handLinked = isHandLinked(wikiContent, name, aliases);
@@ -270,7 +316,7 @@ export function gateCandidates(
     }
 
     const pushDrop = (reason: string) =>
-      candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: 'drop', location, handLinked, reason, classification });
+      candidates.push({ candidate: mkCandidate(), outcome: 'drop', location, handLinked, reason, classification });
 
     if (!slugIsValid(slug, kind)) {
       pushDrop('slug 非法');
@@ -290,7 +336,7 @@ export function gateCandidates(
       pushDrop('slug 仲裁落败（被确定性提名取代）');
       const winner = applyOutcomeTable(location, handLinked, coverage);
       candidates[keptIdx] = {
-        candidate: { name, slug, kind, coverage, summary, aliases },
+        candidate: mkCandidate(),
         outcome: winner.outcome,
         location,
         handLinked,
@@ -305,7 +351,7 @@ export function gateCandidates(
     const finalOutcome: CandidateOutcome = classification.rejected === true ? 'drop' : outcome;
     const finalReason = classification.rejected === true ? '泛化名单（不建页）' : reason;
     keptBySlug.set(slug, candidates.length);
-    candidates.push({ candidate: { name, slug, kind, coverage, summary, aliases }, outcome: finalOutcome, location, handLinked, reason: finalReason, classification });
+    candidates.push({ candidate: mkCandidate(), outcome: finalOutcome, location, handLinked, reason: finalReason, classification });
   }
 
   // 2) 边过滤：端点必须都存活、类型合法、非自环

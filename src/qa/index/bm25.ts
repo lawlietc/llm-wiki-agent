@@ -18,6 +18,7 @@ import path from 'node:path';
 
 import { ValidationError } from '../../errors';
 import { parseNote } from '../../notes/frontmatter';
+import { chunkPage } from '../../notes/chunk';
 import { tokenize } from '../tokenizer';
 import { DIRTY_MARKER_REL } from '../../vault/transaction';
 import { walkMarkdown } from '../../vault/scan';
@@ -27,8 +28,6 @@ import type { Ranked } from '../../reasoning/types';
 
 export const BM25_K1 = 1.5;
 export const BM25_B = 0.75;
-/** chunk 目标字符数（约 300–500 token；中文 1 token≈1 字，注释：可调） */
-export const CHUNK_TARGET_CHARS = 400;
 /** snippet 最大字符数 */
 export const SNIPPET_MAX = 200;
 const INDEX_SCHEMA_VERSION = 1;
@@ -118,36 +117,8 @@ async function writeAtomic(absPath: string, content: string): Promise<void> {
 
 /* ----------------------------- chunking ----------------------------- */
 
-/** 按段落聚合并目标字符数切分；超长段落按句切。返回 chunk 正文数组。 */
-export function chunkPage(body: string, target = CHUNK_TARGET_CHARS): string[] {
-  const paras = body
-    .split(/\n{2,}/)
-    .map((p) => p.trim())
-    .filter(Boolean);
-  const chunks: string[] = [];
-  let cur = '';
-  const flush = () => {
-    if (cur) {
-      chunks.push(cur);
-      cur = '';
-    }
-  };
-  for (const p of paras) {
-    if (cur && cur.length + p.length + 1 > target) flush();
-    if (p.length > target) {
-      // 超长段落按句切（lookbehind 在 Node 20+ 可用）
-      const sentences = p.split(/(?<=[。.!?！？\n])/);
-      for (const s of sentences) {
-        if (cur && cur.length + s.length > target) flush();
-        cur += s;
-      }
-    } else {
-      cur = cur ? `${cur}\n${p}` : p;
-    }
-  }
-  flush();
-  return chunks.length ? chunks : [body.trim()];
-}
+/* chunkPage 已上移到 ../../notes/chunk（M20 工单 02：抽取层要用同一实现切原始正文，
+   而 ingest 不得依赖 qa）。此处只消费，不再定义。 */
 
 /* ----------------------------- buildIndex ----------------------------- */
 

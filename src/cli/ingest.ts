@@ -8,6 +8,7 @@
 
 import { ConfigError } from '../errors';
 import { ingest } from '../ingest/ingest';
+import { DEFAULT_GRANULARITY, DEFAULT_EXTRACT_MODE, type ExtractMode, type Granularity } from '../ingest/extract';
 import {
   executeBatch,
   formatBatchPlan,
@@ -36,6 +37,10 @@ export interface IngestCommandOpts {
   overwrite?: boolean;
   /** M15：忽略短路条件强制全流程（换模型重抽 / 页丢失后重建） */
   force?: boolean;
+  /** 【M20】抽取粒度（缺省 standard，与 M19 逐字一致） */
+  granularity?: Granularity;
+  /** 【M20】抽取模式（缺省 single，与 M19 逐字一致） */
+  extractMode?: ExtractMode;
 }
 
 export interface IngestResult {
@@ -56,6 +61,8 @@ export async function runIngest(
     force: opts.force,
     adopt: opts.adopt,
     overwrite: opts.overwrite,
+    granularity: opts.granularity,
+    extractMode: opts.extractMode,
     // M14：内容短路命中 → approve 前提示（plan 只含 raw 元数据刷新）
     onSkip: () => opts.io.out('内容未变更：跳过 LLM 整理与实体抽取（仅刷新 raw 元数据）'),
     approve: async ({ preview }) => {
@@ -92,6 +99,12 @@ export interface IngestBatchCommandOpts {
   maxBytes?: number;
   /** 相对路径的解析基准（默认 process.cwd()） */
   cwd?: string;
+  /** 【M20】抽取粒度：整批共用（缺省 standard） */
+  granularity?: Granularity;
+  /** 【M20】抽取模式：整批共用（缺省 single） */
+  extractMode?: ExtractMode;
+  /** 【M20】--json：预演或报告改以 JSON 输出（机器可读；默认渲染人类可读文本） */
+  json?: boolean;
 }
 
 /**
@@ -119,6 +132,20 @@ export async function runIngestBatch(
     },
   });
 
+  if (opts.json === true && opts.planOnly === true) {
+    io.out(
+      JSON.stringify(
+        {
+          ...plan,
+          granularity: opts.granularity ?? DEFAULT_GRANULARITY,
+          extractMode: opts.extractMode ?? DEFAULT_EXTRACT_MODE,
+        },
+        null,
+        2,
+      ),
+    );
+    return null;
+  }
   io.out(formatBatchPlan(plan));
 
   if (opts.planOnly) return null;
@@ -144,9 +171,15 @@ export async function runIngestBatch(
     force: opts.force,
     adopt: opts.adopt,
     overwrite: opts.overwrite,
+    granularity: opts.granularity,
+    extractMode: opts.extractMode,
     autoApprove: true, // I37：已一次性确认，逐项沿用
   });
 
-  io.out(formatBatchReport(report));
+  if (opts.json === true) {
+    io.out(JSON.stringify(report, null, 2));
+  } else {
+    io.out(formatBatchReport(report));
+  }
   return report;
 }
