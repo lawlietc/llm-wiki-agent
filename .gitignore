@@ -3,6 +3,7 @@ coverage/
 dist/
 *.tmp
 .tmp-wiki-cli.mjs
+.tmp-wiki-web.mjs
 .DS_Store
 
 # npm 本地缓存（绕开沙箱对全局缓存目录的写限制时生成）
@@ -19,3 +20,6 @@ test/
 wiki/
 # 只忽略仓库根级 notes/（内容目录）；不能写 notes/——会连带忽略 src/notes/（M13 实体分类源码）
 /notes/
+
+# spike 观测产物（dev/trace-spike.ts 落盘的 trace JSON 与 md 视图；可随时删除）
+dev/trace-out/

@@ -24,7 +24,7 @@ import { normalizeSourceUrl } from './source-url';
 import { renderRawNote } from '../notes/template';
 import { parseFrontmatter } from '../notes/frontmatter';
 import { summarizeToWiki } from './summarize';
-import { extractEntities, detectContradictions, DEFAULT_GRANULARITY, DEFAULT_EXTRACT_MODE, MAX_ENTITIES, MAX_RELATIONS, type ExtractMode, type Granularity } from './extract';
+import { extractEntities, detectContradictions, DEFAULT_GRANULARITY, DEFAULT_EXTRACT_MODE, MAX_ENTITIES, MAX_RELATIONS, type ExtractMode, type Granularity, type ExtractionResult } from './extract';
 import { gateCandidates, ENTITY_KINDS, type Coverage, type EntityKind, type FactRef, type GatedCandidate, type GateResult } from './candidate-gate';
 import { groupRelationsBySlug, mergeRelationMaps } from '../notes/relations';
 import { renderEntityPage, withFrontmatterRelations, extractMention } from '../notes/entity-page';
@@ -84,6 +84,13 @@ export interface IngestOptions {
    * 单条 ingest 不传（undefined = 只看盘）。
    */
   reservedRawRels?: ReadonlySet<string>;
+  /**
+   * 【spike 观测】填充 `PreparedIngest.trace`（门控全量 + 抽取原始结果）。
+   *
+   * 纯观测用途，**零行为影响**：缺省 `undefined`（falsy）时返回对象与改动前
+   * 字节级一致；打开时也只是在返回对象上多挂一个只读字段，不改变任何写入/校验路径。
+   */
+  collectTrace?: boolean;
 }
 
 /** sourceUrl → raw 页文件名（稳定、可移植；去协议/query，非字母数字转 `-`） */
@@ -729,6 +736,32 @@ export interface PreparedIngest {
   relMap: Map<string, Map<string, string[]>>;
   /** 本项存活候选（drop 已剔除） */
   candidates: PreparedCandidate[];
+  /**
+   * 【spike 观测】相位 A 的观测产物；**仅当 `IngestOptions.collectTrace` 为真时填充**，
+   * 缺省 `undefined`（既有调用方行为逐字不变）。
+   */
+  trace?: IngestTrace;
+}
+
+/**
+ * 【spike 观测】相位 A 的观测快照（I-W1' 只增不改）。
+ *
+ * 存在的理由：门控全量结果（含被 drop 的候选及其判决理由）与抽取原始结果在
+ * `prepareIngest` 内部被消费后即不可达——`gated.candidates` 里 drop 的成员会被
+ * `alive` 过滤掉，`extraction` 是局部变量。评测（evals）恰恰最需要这些信号，
+ * 故由编排层在显式开启时原样透出。
+ *
+ * 该结构只读，不参与任何写盘/校验逻辑。
+ */
+export interface IngestTrace {
+  /** 门控全量结果（含 `outcome: 'drop'` 的候选，及各自的 reason/classification/location） */
+  gate: GateResult;
+  /** 抽取原始结果（含原始回稿、warnings、truncated）；抽取失败降级时为 null */
+  extraction: ExtractionResult | null;
+  /** 抽取是否发生过降级（I28：失败只降级不阻断） */
+  extractionFailed: boolean;
+  /** 降级时的错误信息（多个错误只保留最后一条；无则缺省） */
+  extractionError?: string;
 }
 
 /** 提交相位可被覆盖的部分（工单 06 的跨源归并结果在此注入） */
@@ -886,6 +919,10 @@ export async function prepareIngest(
   // 抽取回稿不可解析时降级为空（不建词条、不写 relations），不阻断 ingest 主流程（I4）。
   let gated: GateResult = { candidates: [], edges: [] };
   let extractionFailed = 0;
+  // 【spike 观测】透出用暂存：既有代码把 extraction 留在 try 块内，这里提升到外层
+  // 以便 `collectTrace` 时随返回值透出；不开启观测时这两个变量只被赋值、不被读取。
+  let extractionResult: ExtractionResult | null = null;
+  let lastExtractError: string | undefined;
   const granularity = opts?.granularity ?? DEFAULT_GRANULARITY;
   const extractMode = opts?.extractMode ?? DEFAULT_EXTRACT_MODE;
   try {
@@ -893,6 +930,7 @@ export async function prepareIngest(
       granularity,
       extractMode,
     });
+    extractionResult = extraction;
     // 工单 06：事实在入口盖「属于哪个源」的章——跨源归并后各源事实仍回到各自的分块
     // 编号空间（抽取层不知道 raw 落点，只能由编排层补）。
     for (const e of extraction.entities) {
@@ -924,6 +962,7 @@ export async function prepareIngest(
     if (isMustAbort(err)) throw err;
     extractionFailed++;
     const msg = err instanceof Error ? err.message : String(err);
+    lastExtractError = msg;
     opts?.io?.err(`[ENTITY_EXTRACT_FAILED] ${meta.sourceUrl}: ${msg}`);
   }
   if (extractionFailed > 0) {
@@ -977,6 +1016,17 @@ export async function prepareIngest(
     date: ingestDate,
     relMap,
     candidates,
+    // 【spike 观测】条件展开：缺省（falsy）时不产生该键 → 返回对象与改动前逐字一致
+    ...(opts?.collectTrace
+      ? {
+          trace: {
+            gate: gated,
+            extraction: extractionResult,
+            extractionFailed: extractionFailed > 0,
+            ...(lastExtractError !== undefined ? { extractionError: lastExtractError } : {}),
+          } satisfies IngestTrace,
+        }
+      : {}),
   };
 }
 
