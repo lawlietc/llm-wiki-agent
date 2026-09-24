@@ -2,6 +2,9 @@
 
 > 目标：把「参数调优靠感觉」变成「参数调优看数字」。
 > 一份 golden + 一次提取 = 一组可比较的指标。
+>
+> **阅读顺序**：先读「一、标注标准」与「一之二、先读懂你看到的记号」——后者解释 compare.md 里的
+> 四组组合、page/stub/drop、`fN` 各是什么意思，以及判决的判据。**不看一之二就标注，会把系统判决误当事实。**
 
 ---
 
@@ -22,6 +25,147 @@
 1. **判「该不该存在」，不判「该是什么类型」** —— kind（concept/person）与 outcome（page/stub）是别的问题
 2. **以「对未来有用」为准，不以「原文提到了」为准** —— 提到 ≠ 值得建页
 3. **边界模糊标 `?`，不要硬猜** —— 硬猜会污染 golden
+
+---
+
+## 一之二、先读懂你看到的记号（判决 / 四组 / fN）
+
+标注前必须先读懂 compare.md 里的三类记号，否则会把「系统判决」误当「事实」。
+
+### 2.1 四组参数组合是什么意思
+
+它们是两个**正交参数**的 2×2 排列：
+
+| 组合 | `granularity` | `extractMode` |
+|---|---|---|
+| `standard-single` | `standard`（默认档） | `single`（默认模式） |
+| `standard-cited` | `standard` | `cited`（引用式） |
+| `exhaustive-single` | `exhaustive`（穷尽档） | `single` |
+| `exhaustive-cited` | `exhaustive` | `cited` |
+
+- **参数 1 `granularity`（想抽多少）**：`standard` = 抽有实质段落的实体（默认）；`exhaustive` = 连**仅被点名**的命名技术/概念也建页。
+- **参数 2 `extractMode`（怎么抽）**：`single` = 一次调用同时产出实体+关系；`cited` = 两阶段（先识别骨架 → 再分块引用 → 用原文片段组装事实）。
+
+`standard-single` 是**基线**（两个参数都用默认），其余三组各动一个或两个变量 —— 这样能归因：「召回涨了」是粒度的功劳还是模式的功劳。
+
+> `cited` 与 `single` 的关键区别：`single` 的事实是**模型转述**，`cited` 的事实是**逐字原文**。这也是 `cited` 更贵（多次调用）但 `factsCoverage` 更高的原因。
+
+### 2.2 page / stub / drop 是什么意思
+
+这是每个实体**经过门控后的判决结果**（源码：`applyOutcomeTable`，S135 路由）：
+
+| 判决 | 含义 | 后果 |
+|---|---|---|
+| `page` ✅ | 建**完整页** | 实体在正文有成段讨论 → 生成完整实体页 |
+| `stub` ⚠️ | 建**桩页** | 只被点名/浅提 → 建占位页（一句话摘要，正文待补） |
+| `drop` ❌ | **丢弃** | 不该建页 → 连桩都不建 |
+
+对比表中的计数（如 `page 18 / stub 2 / drop 0`）= 该组参数下的判决分布。
+
+### 2.3 判据详解：三个输入 + 判决表
+
+判决需要三个输入，来源**完全不同**（这点对归因至关重要）：
+
+| 输入 | 值域 | 谁算的 | 怎么算 |
+|---|---|---|---|
+| **`location`** | `prose` / `aside` / `absent` | **代码**（确定性，可复核） | 实体名（含别名）在原文中的出现形态 |
+| **`coverage`** | `defined` / `discussed` / `named` | **LLM**（模型自报，可能不准） | 抽取回稿里模型填的字段 |
+| **`handLinked`** | `true` / `false` | **代码**（确定性，可复核） | 该名字是否出现在生成页的 `[[...]]` 里 |
+
+**`location` 怎么算**（`classifyCandidate`）：对名字（或任一别名）在原文里找所有出现位置 ——
+
+```
+每个出现位置：
+  在括号内？           ┐
+  或在短列表项里？      ┘ → 记为 aside
+（短列表项 = 行首是 - * · 或 1. 2) 这类标记，且该行长度 ≤ 阈值）
+
+所有出现位置都是 aside → location = 'aside'
+至少一个在正文          → location = 'prose'
+一个都找不到            → location = 'absent'
+```
+
+**`coverage` 怎么来**：由 LLM 在抽取回稿里自报（`defined`=原文给出定义；`discussed`=展开讨论；`named`=仅提及）。**它会随 prompt 变化** —— 同一实体在 `standard` 与 `exhaustive` 下可能报不同的 coverage，这不是判决逻辑不稳。
+
+**判决表**（⚠️ 注意顺序：`handLinked` 最先判且直接短路）：
+
+| 优先级 | `location` | `coverage` | 判决 | 理由串 |
+|---|---|---|---|---|
+| **1** | *任意* | *任意* | **page** | `hand-linked` |
+| 2 | `absent` | *任意* | **drop** | `absent` |
+| 3 | `prose` | `defined` / `discussed` | **page** | `prose+defined` |
+| 4 | `prose` | `named` | **stub** | `prose+named（分歧 → stub）` |
+| 5 | `aside` | `defined` / `discussed` | **stub** | `aside+defined（分歧 → stub）` |
+| 6 | `aside` | `named` | **drop** | `aside+named（一致否决）` |
+
+**「两道门」的含义**：`location`（代码据原文位置判）与 `coverage`（模型据理解程度判）是两道独立的门：
+
+```
+一致认可（prose + defined/discussed） → page
+分歧     （prose + named）           → stub（位置说重要，模型说浅）
+分歧     （aside + defined/discussed）→ stub（位置说旁注，模型说深）
+一致否决（aside + named）            → drop
+位置门否决（absent）                  → drop
+```
+
+**分歧时给 `stub` 而非直接砍**是保守设计：两边有一个说「重要」就留桩，避免误杀。`stub` 的意义就是「拿不准，先占位」。
+
+### 2.4 `fN` 是什么意思
+
+`f` = **facts（逐字事实）条数**。`f11` = 该实体在该组下有 11 条逐字原文事实。
+
+- `single` 模式**不产出** facts → 该列显示 `✅`（无 `fN`）
+- `cited` 模式产出 facts → 显示 `✅ f11`
+
+**为什么这个记号重要**：`single` 与 `cited` 的 page/stub/drop 计数几乎相同（如都 18 page），光看判决**看不出 cited 多花 2~3 倍成本换来了什么**。`fN` 就是答案 —— `cited` 给每个实体补上了逐字原文事实，`single` 一条都没有（实测：single 0/20 候选有 facts，cited 22/22 候选共 101 条）。
+
+### 2.5 怎么读一整行（完整例子）
+
+```
+| 实体       | ss    | sc     | es    | ec     | 门理由                      | 裁决 |
+| LLM wiki   | ✅    | ✅ f11 | ✅    | ✅ f11 | prose+defined/hand-linked  | y    |
+```
+
+读法：该实体 4 组都判 `page`；在 `cited` 两组各有 11 条逐字事实；门理由为 `prose+defined`（正文成段定义）或 `hand-linked`（原文手工链接）；你的裁决 = `y`。
+
+对照行：
+
+```
+| BM25       | ·     | ❌ f1  | ❌    | ❌ f1  | aside+named（一致否决）      | y    |
+```
+
+读法：该实体在 `standard-single` 下 **`·` = 根本没被提名**；其余三组判 `drop`（`location=aside`——只出现在短列表项；`coverage=named`——模型认为仅点名）；你标 `y` → 意味着「三组都判错了，该抽」→ **指向改门控规则**。
+
+**图例速查**（compare.md 正文也有）：
+
+```
+✅ page ｜ ⚠️ stub ｜ ❌ drop ｜ · 未提名 ｜ fN = 带 N 条逐字原文事实
+```
+
+### 2.6 为什么要先读懂判决 —— 它决定你「该改代码还是改 prompt」
+
+你的标注（`y`/`n`）和系统判决（page/stub/drop）是**两个独立的东西**：
+
+- **判决** = 系统按规则算的（上面 2.3 的表）
+- **标注** = 你按「未来有用吗」判的
+
+两者的**差集**才是有价值的信息：
+
+| 你的标注 | 系统判决 | 含义 |
+|---|---|---|
+| `y` | `page` | 一致，没问题 |
+| `y` | `stub` / `drop` | **系统漏了** → 召回损失 |
+| `n` | `stub` / `drop` | 一致，没问题 |
+| `n` | `page` | **系统多了** → 精确损失 |
+
+而**归因**（这是 trace 最值钱的地方）：
+
+| 出错的门 | 判据来源 | 该改什么 |
+|---|---|---|
+| `location` 判错（如 BM25 被当 aside） | **代码**（`classifyCandidate` 的括号/短列表规则） | **改代码** |
+| `coverage` 判错（模型报错 defined/named） | **LLM**（随 prompt 变） | **改 prompt** |
+
+**所以标注时看到一条 `drop`，要问自己**：是名字**出现的位置**不该被判 aside（改代码），还是模型**对深度的判断**错了（改 prompt）？两种结论指向完全不同的修复动作。
 
 ---
 
@@ -156,3 +300,5 @@ dev/
 3. **不要硬猜模糊项** —— 标 `?` 比标错好。指标只算 `y`/`n`。
 4. **裁决粒度是实体，不是参数组** —— 「BM25 该不该存在」只有一个答案。
 5. **对齐有已知边界** —— 同义词（`双向链接` vs `双链`）与拼音（`raw层` vs `raw-ceng`）无法自动归并，compare.md 末尾的「对齐可疑项」会列出来供人工核对。
+6. **别把「系统判决」当「事实」** —— `page`/`stub`/`drop` 是系统按规则算的**结论**，不是真理。你的 `y`/`n` 才是标准。两者不一致正是你要找的信号（见 2.6）。
+7. **判决变化 ≠ 逻辑不稳** —— 同一实体在不同组判决不同（如 stub↔page），通常是因为**模型报的 `coverage` 变了**（`coverage` 来自 LLM，随 prompt 变），而非判决规则不稳。`location` 与 `handLinked` 是确定性的。
