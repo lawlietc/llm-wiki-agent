@@ -15,6 +15,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { alignCandidates, loadRuns, normalizeName, type AlignedCandidate } from './trace/align';
+import { REASON_TAGS } from './trace/reason-tags';
 import type { CandidateTrace, Span, Trace } from './trace/schema';
 
 export interface Golden {
@@ -22,32 +23,47 @@ export interface Golden {
   mustExist: string[];
   mustNotExist: string[];
   unsure: string[];
+  /** 归因标签：实体名 → 标签 */
+  reasons: Map<string, string>;
 }
 
-/** 极简 YAML 解析（只认我们自己的 golden 形状：source + 三个字符串列表） */
+/** 极简 YAML 解析（只认我们自己的 golden 形状：source + 三个字符串列表 + reasons 映射） */
 export function parseGolden(text: string): Golden {
   const lines = text.split('\n');
   let source = '';
   const lists: Record<string, string[]> = { must_exist: [], must_not_exist: [], unsure: [] };
+  const reasons = new Map<string, string>();
   let cur: string | null = null;
   for (const raw of lines) {
     const line = raw.replace(/\s+$/, '');
     if (line.startsWith('#') || line.trim() === '') continue;
+
+    // reasons 映射：`  <name>: <tag>`
+    if (cur === 'reasons') {
+      const m = /^\s+([^:]+):\s*(.+)$/.exec(line);
+      if (m !== null) {
+        reasons.set(unquote(m[1]!), unquote(m[2]!));
+        continue;
+      }
+    }
+
     const kv = /^(\w+):\s*(.*)$/.exec(line);
-    if (kv !== null && kv[2] !== undefined && !line.startsWith('  -')) {
+    if (kv !== null && !line.startsWith('  -')) {
       if (kv[1] === 'source') {
-        source = unquote(kv[2]);
+        source = unquote(kv[2]!);
         cur = null;
-      } else if (kv[1] in lists) {
-        cur = kv[1];
-        if (kv[2] !== '' && kv[2] !== '[]') lists[cur]!.push(unquote(kv[2]));
+      } else if (kv[1] === 'reasons') {
+        cur = 'reasons';
+      } else if (kv[1]! in lists) {
+        cur = kv[1]!;
+        if (kv[2] !== '' && kv[2] !== '[]') lists[cur]!.push(unquote(kv[2]!));
       }
       continue;
     }
     const item = /^\s+-\s+(.*)$/.exec(line);
-    if (item !== null && cur !== null) lists[cur]!.push(unquote(item[1] ?? ''));
+    if (item !== null && cur !== null && cur !== 'reasons') lists[cur]!.push(unquote(item[1] ?? ''));
   }
-  return { source, mustExist: lists['must_exist']!, mustNotExist: lists['must_not_exist']!, unsure: lists['unsure']! };
+  return { source, mustExist: lists['must_exist']!, mustNotExist: lists['must_not_exist']!, unsure: lists['unsure']!, reasons };
 }
 
 function unquote(s: string): string {
@@ -161,6 +177,29 @@ async function main(): Promise<void> {
       console.log(`| ${combo} | ${row.extracted} | ${row.hitMust}/${row.mustTotal}=${pct(row.recall)} | ${pct(row.precision)} | ${pct(row.factsCoverage)} | ${row.unlabeled} |`);
     }
     void aligned;
+
+    // 归因统计：噪声按标签分布（回答「该修哪一环」）
+    if (golden.reasons.size > 0) {
+      const byTag = new Map<string, string[]>();
+      for (const [name, tag] of golden.reasons) {
+        const arr = byTag.get(tag) ?? [];
+        arr.push(name);
+        byTag.set(tag, arr);
+      }
+      console.log(`\n### 归因分布（共 ${golden.reasons.size} 条人工理由）\n`);
+      console.log('| 归因标签 | 条数 | 实体 | 指向的修复 |');
+      console.log('|---|---|---|---|');
+      for (const [tag, names] of [...byTag.entries()].sort((a, b) => b[1].length - a[1].length)) {
+        const meta = REASON_TAGS.find((t) => t.tag === tag);
+        console.log(`| ${tag} | ${names.length} | ${names.slice(0, 3).join('、')}${names.length > 3 ? '…' : ''} | ${meta?.fix ?? '（未知标签）'} |`);
+      }
+    }
+
+    // 缺理由提醒
+    const needReason = [...golden.mustNotExist, ...golden.unsure].filter((n) => !golden.reasons.has(n));
+    if (needReason.length > 0) {
+      console.log(`\n> ⚠️ ${needReason.length} 个 n/? 实体未填归因标签，无法归因到修复动作：${needReason.slice(0, 5).join('、')}${needReason.length > 5 ? '…' : ''}`);
+    }
   }
 }
 

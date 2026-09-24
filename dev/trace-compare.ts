@@ -14,6 +14,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { alignCandidates, loadRuns, normalizeName, type AlignedCandidate } from './trace/align';
+import { REASON_TAGS } from './trace/reason-tags';
 import type { CandidateTrace, RunManifest, Span, Trace } from './trace/schema';
 
 const COMBOS = ['standard-single', 'standard-cited', 'exhaustive-single', 'exhaustive-cited'];
@@ -110,6 +111,21 @@ async function main(): Promise<void> {
     const reasons = [...new Set([...g.byCombo.values()].map((c) => c.reason))].join(' / ');
     L.push(`| **${g.displayName}** | ${cells.join(' | ')} | ${reasons} | ☐该抽 ☐不该抽 |`);
   }
+  L.push('');
+
+  // 裁决理由（人工归因）—— 只在标 n / ? 时需要
+  L.push('## 裁决理由（人工）');
+  L.push('');
+  L.push('> 只对**标 `n` 或 `?`** 的实体需要填（标 `y` 的不用写）。');
+  L.push('> 格式：`- <实体名> | <归因标签>`（可加 `——` 后写补充说明，说明不参与统计）。');
+  L.push('>');
+  L.push('> **归因标签**（固定枚举，选最贴近的一个）：');
+  for (const t of REASON_TAGS) L.push(`> - \`${t.tag}\` — ${t.desc}`);
+  L.push('');
+  L.push('<!-- 在下面逐行填写；示例（本段是注释，不会被读取）：');
+  L.push(`- 不可能三角 | 通用概念 —— 是常见决策框架，不是本文专有`);
+  L.push(`- hot.md | 非实体`);
+  L.push('-->');
   L.push('');
 
   // 差异高亮

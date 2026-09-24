@@ -49,23 +49,75 @@ export function normalizeVerdict(v: string): 'y' | 'n' | '?' {
   return '?';
 }
 
+/** 分析产物的一个条目 */
+export interface GoldenEntry {
+  name: string;
+  verdict: 'y' | 'n' | '?';
+  /** 归因标签（仅 n/? 有；未填或不在枚举内则缺省） */
+  tag?: string;
+  /** 标签后的自由说明（不参与统计） */
+  note?: string;
+}
+
+/**
+ * 解析「## 裁决理由（人工）」节。
+ * 行格式：`- <实体名> | <标签> —— <说明>`（`——` 与说明可省）
+ *
+ * 跳过 HTML 注释块（`<!-- ... -->`）—— 模板里的示例放在注释中，不应被当作真实标注。
+ */
+export function parseReasonSection(md: string): Map<string, { tag: string; note?: string }> {
+  const out = new Map<string, { tag: string; note?: string }>();
+  const lines = md.split('\n');
+  let inSection = false;
+  let inComment = false;
+  for (const line of lines) {
+    // HTML 注释块开关（示例写在注释里，必须跳过）
+    if (line.includes('<!--')) inComment = true;
+    if (inComment) {
+      if (line.includes('-->')) inComment = false;
+      continue;
+    }
+    if (line.startsWith('## 裁决理由')) {
+      inSection = true;
+      continue;
+    }
+    if (inSection && line.startsWith('## ')) break; // 下一节
+    if (!inSection) continue;
+    // 跳过引用块（以 > 开头的说明行）与空行
+    if (line.trimStart().startsWith('>')) continue;
+    const m = /^-\s+([^|]+?)\s*\|\s*([^\s—]+)\s*(?:——\s*(.*))?$/.exec(line.trim());
+    if (m === null) continue;
+    const name = m[1]!.trim();
+    const tag = m[2]!.trim();
+    const note = m[3]?.trim();
+    if (name === '' || tag === '') continue;
+    out.set(name, { tag, ...(note !== undefined && note !== '' ? { note } : {}) });
+  }
+  return out;
+}
+
 function yamlEscape(s: string): string {
   // 含特殊字符时用单引号（YAML 单引号里单引号需双写）
   if (/[:#\-{}[\],&*?|>'"%@`\n]/.test(s) || s.trim() !== s) return `'${s.replace(/'/g, "''")}'`;
   return s;
 }
 
-async function extractOne(comparePath: string, outPath: string): Promise<{ y: number; n: number; q: number }> {
+async function extractOne(comparePath: string, outPath: string): Promise<{ y: number; n: number; q: number; missingReason: string[] }> {
   const md = await readFile(comparePath, 'utf8');
   const rows = parseAnnotatedTable(md);
   if (rows.length === 0) throw new Error(`未在 ${comparePath} 解析到候选表`);
 
+  const reasons = parseReasonSection(md);
   const srcMatch = /^# 参数对比（待标注）：(.+)$/m.exec(md);
   const source = srcMatch?.[1]?.trim() ?? path.basename(comparePath, '.compare.md');
 
   const mustExist = rows.filter((r) => normalizeVerdict(r.verdict) === 'y').map((r) => r.name);
   const mustNotExist = rows.filter((r) => normalizeVerdict(r.verdict) === 'n').map((r) => r.name);
   const unsure = rows.filter((r) => normalizeVerdict(r.verdict) === '?').map((r) => r.name);
+
+  // 校验：标 n / ? 的应当有归因标签（缺失只警告，不阻断——但不阻断会降低指标可用性）
+  const needReason = [...mustNotExist, ...unsure];
+  const missingReason = needReason.filter((name) => !reasons.has(name));
 
   const lines: string[] = [];
   lines.push('# golden 标注（由 trace-extract-golden.ts 从 compare.md 提取；请勿手改此文件，改 compare.md 再重跑）');
@@ -87,10 +139,21 @@ async function extractOne(comparePath: string, outPath: string): Promise<{ y: nu
   for (const n of unsure) lines.push(`  - ${yamlEscape(n)}`);
   if (unsure.length === 0) lines.push('  []');
   lines.push('');
+  // 归因标签（供 trace-score.ts 聚合统计）
+  lines.push('# 归因标签（键 = 实体名，值 = 标签）—— 标 n/? 的实体应有');
+  lines.push('reasons:');
+  const reasonEntries = [...reasons.entries()];
+  if (reasonEntries.length === 0) lines.push('  {}');
+  else {
+    for (const [name, r] of reasonEntries) {
+      lines.push(`  ${yamlEscape(name)}: ${yamlEscape(r.tag)}`);
+    }
+  }
+  lines.push('');
 
   await mkdir(path.dirname(outPath), { recursive: true });
   await writeFile(outPath, lines.join('\n'), 'utf8');
-  return { y: mustExist.length, n: mustNotExist.length, q: unsure.length };
+  return { y: mustExist.length, n: mustNotExist.length, q: unsure.length, missingReason };
 }
 
 async function main(): Promise<void> {
@@ -131,6 +194,11 @@ async function main(): Promise<void> {
     console.log(`✅ ${t.out}`);
     console.log(`   must_exist ${r.y} ｜ must_not_exist ${r.n} ｜ unsure ${r.q}`);
     if (r.y === 0) console.log(`   ⚠️ 没有标任何 y —— 请先编辑 compare.md 的「裁决」列（填 y/n/?）再重跑`);
+    if (r.missingReason.length > 0) {
+      console.log(`   ⚠️ ${r.missingReason.length} 个 n/? 实体缺归因标签（建议补，否则无法归因到修复动作）：`);
+      for (const name of r.missingReason.slice(0, 8)) console.log(`      - ${name}`);
+      if (r.missingReason.length > 8) console.log(`      … 其余 ${r.missingReason.length - 8} 个`);
+    }
   }
 }
 
