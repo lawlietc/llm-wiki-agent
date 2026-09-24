@@ -38,11 +38,13 @@ export function parseGolden(text: string): Golden {
     const line = raw.replace(/\s+$/, '');
     if (line.startsWith('#') || line.trim() === '') continue;
 
-    // reasons 映射：`  <name>: <tag>`
+    // reasons 映射：`  <name>: <tag>  # <说明>`
     if (cur === 'reasons') {
       const m = /^\s+([^:]+):\s*(.+)$/.exec(line);
       if (m !== null) {
-        reasons.set(unquote(m[1]!), unquote(m[2]!));
+        // 剥离行内注释（`# ...`），但保留值本身
+        const valuePart = (m[2] ?? '').split(/\s+#\s+/)[0] ?? '';
+        reasons.set(unquote(m[1]!), unquote(valuePart.trim()));
         continue;
       }
     }
