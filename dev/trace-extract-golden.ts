@@ -11,9 +11,9 @@
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-/** 解析 compare.md 主表中的「实体 | ... | 裁决」行 */
-export function parseAnnotatedTable(md: string): { name: string; verdict: string }[] {
-  const out: { name: string; verdict: string }[] = [];
+/** 解析 compare.md 主表的行：实体名 + 裁决（倒数第 2 列）+ 归因标签（倒数第 1 列） */
+export function parseAnnotatedTable(md: string): { name: string; verdict: string; tag: string }[] {
+  const out: { name: string; verdict: string; tag: string }[] = [];
   const lines = md.split('\n');
   let inTable = false;
   for (const line of lines) {
@@ -28,14 +28,17 @@ export function parseAnnotatedTable(md: string): { name: string; verdict: string
       }
       if (/^\|\s*-+/.test(line)) continue; // 分隔行
       const cells = line.split('|').map((c) => c.trim());
-      // 形如 ['', '实体', 'ss', 'sc', 'es', 'ec', '门理由', '裁决', '']
-      if (cells.length < 4) continue;
-      const nameRaw = cells[1] ?? '';
-      const verdict = cells[cells.length - 2] ?? '';
-      // 去掉 markdown 粗体
-      const name = nameRaw.replace(/^\*\*|\*\*$/g, '').trim();
+      // 表头：| 实体 | ss | sc | es | ec | 门理由 | 裁决 | 归因标签 |
+      // split 后两端各有一个空串；列固定为 实体=1 ... 裁决=len-3, 归因标签=len-2
+      if (cells.length < 7) continue;
+      const name = (cells[1] ?? '').replace(/^\*\*|\*\*$/g, '').trim();
+      // 用「从右侧数」的稳健定位：忽略末尾空单元格
+      const trimmed = cells[cells.length - 1] === '' ? cells.slice(0, -1) : cells;
+      const verdict = (trimmed[trimmed.length - 2] ?? '').trim();
+      const tagRaw = (trimmed[trimmed.length - 1] ?? '').trim();
+      const tag = tagRaw === '·' || tagRaw === '-' || tagRaw === '—' ? '' : tagRaw;
       if (name === '') continue;
-      out.push({ name, verdict: verdict.trim() });
+      out.push({ name, verdict, tag });
     }
   }
   return out;
@@ -60,18 +63,17 @@ export interface GoldenEntry {
 }
 
 /**
- * 解析「## 裁决理由（人工）」节。
- * 行格式：`- <实体名> | <标签> —— <说明>`（`——` 与说明可省）
+ * 解析「## 裁决理由（人工）」节的**补充说明**（可选）。
+ * 行格式：`- <实体名> —— <说明>`（本节的标签枚举表与引用块会被跳过）
  *
  * 跳过 HTML 注释块（`<!-- ... -->`）—— 模板里的示例放在注释中，不应被当作真实标注。
  */
-export function parseReasonSection(md: string): Map<string, { tag: string; note?: string }> {
-  const out = new Map<string, { tag: string; note?: string }>();
+export function parseReasonSection(md: string): Map<string, string> {
+  const out = new Map<string, string>();
   const lines = md.split('\n');
   let inSection = false;
   let inComment = false;
   for (const line of lines) {
-    // HTML 注释块开关（示例写在注释里，必须跳过）
     if (line.includes('<!--')) inComment = true;
     if (inComment) {
       if (line.includes('-->')) inComment = false;
@@ -81,17 +83,15 @@ export function parseReasonSection(md: string): Map<string, { tag: string; note?
       inSection = true;
       continue;
     }
-    if (inSection && line.startsWith('## ')) break; // 下一节
+    if (inSection && line.startsWith('## ')) break;
     if (!inSection) continue;
-    // 跳过引用块（以 > 开头的说明行）与空行
-    if (line.trimStart().startsWith('>')) continue;
-    const m = /^-\s+([^|]+?)\s*\|\s*([^\s—]+)\s*(?:——\s*(.*))?$/.exec(line.trim());
+    if (line.trimStart().startsWith('>') || line.trimStart().startsWith('|')) continue; // 引用块 / 枚举表
+    const m = /^-\s+([^—]+?)\s*——\s*(.+)$/.exec(line.trim());
     if (m === null) continue;
     const name = m[1]!.trim();
-    const tag = m[2]!.trim();
-    const note = m[3]?.trim();
-    if (name === '' || tag === '') continue;
-    out.set(name, { tag, ...(note !== undefined && note !== '' ? { note } : {}) });
+    const note = m[2]!.trim();
+    if (name === '' || note === '') continue;
+    out.set(name, note);
   }
   return out;
 }
@@ -107,7 +107,7 @@ async function extractOne(comparePath: string, outPath: string): Promise<{ y: nu
   const rows = parseAnnotatedTable(md);
   if (rows.length === 0) throw new Error(`未在 ${comparePath} 解析到候选表`);
 
-  const reasons = parseReasonSection(md);
+  const reasons = parseReasonSection(md); // 补充说明（可选）
   const srcMatch = /^# 参数对比（待标注）：(.+)$/m.exec(md);
   const source = srcMatch?.[1]?.trim() ?? path.basename(comparePath, '.compare.md');
 
@@ -115,9 +115,17 @@ async function extractOne(comparePath: string, outPath: string): Promise<{ y: nu
   const mustNotExist = rows.filter((r) => normalizeVerdict(r.verdict) === 'n').map((r) => r.name);
   const unsure = rows.filter((r) => normalizeVerdict(r.verdict) === '?').map((r) => r.name);
 
+  // 归因标签取自表格的「归因标签」列（主填位置）
+  const tags = new Map<string, string>();
+  for (const r of rows) {
+    if (r.tag !== '' && (normalizeVerdict(r.verdict) === 'n' || normalizeVerdict(r.verdict) === '?')) {
+      tags.set(r.name, r.tag);
+    }
+  }
+
   // 校验：标 n / ? 的应当有归因标签（缺失只警告，不阻断——但不阻断会降低指标可用性）
   const needReason = [...mustNotExist, ...unsure];
-  const missingReason = needReason.filter((name) => !reasons.has(name));
+  const missingReason = needReason.filter((name) => !tags.has(name));
 
   const lines: string[] = [];
   lines.push('# golden 标注（由 trace-extract-golden.ts 从 compare.md 提取；请勿手改此文件，改 compare.md 再重跑）');
@@ -139,14 +147,14 @@ async function extractOne(comparePath: string, outPath: string): Promise<{ y: nu
   for (const n of unsure) lines.push(`  - ${yamlEscape(n)}`);
   if (unsure.length === 0) lines.push('  []');
   lines.push('');
-  // 归因标签（供 trace-score.ts 聚合统计）
+  // 归因标签（供 trace-score.ts 聚合统计）+ 可选补充说明
   lines.push('# 归因标签（键 = 实体名，值 = 标签）—— 标 n/? 的实体应有');
   lines.push('reasons:');
-  const reasonEntries = [...reasons.entries()];
-  if (reasonEntries.length === 0) lines.push('  {}');
+  if (tags.size === 0) lines.push('  {}');
   else {
-    for (const [name, r] of reasonEntries) {
-      lines.push(`  ${yamlEscape(name)}: ${yamlEscape(r.tag)}`);
+    for (const [name, tag] of tags) {
+      const note = reasons.get(name);
+      lines.push(`  ${yamlEscape(name)}: ${yamlEscape(tag)}${note !== undefined ? `  # ${note}` : ''}`);
     }
   }
   lines.push('');

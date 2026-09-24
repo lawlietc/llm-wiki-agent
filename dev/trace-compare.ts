@@ -104,27 +104,33 @@ async function main(): Promise<void> {
   L.push('');
   L.push(`图例：✅ page ｜ ⚠️ stub ｜ ❌ drop ｜ · 未提名 ｜ \`fN\` = 带 N 条逐字原文事实`);
   L.push('');
-  L.push(`| 实体 | ${runs.map((r) => label(r.combo)).join(' | ')} | 门理由（各组） | 裁决 |`);
-  L.push(`|---|${runs.map(() => '---').join('|')}|---|---|`);
+  L.push(`| 实体 | ${runs.map((r) => label(r.combo)).join(' | ')} | 门理由（各组） | 裁决 | 归因标签 |`);
+  L.push(`|---|${runs.map(() => '---').join('|')}|---|---|---|`);
   for (const g of aligned) {
     const cells = runs.map((r) => cell(g.byCombo.get(r.combo)));
     const reasons = [...new Set([...g.byCombo.values()].map((c) => c.reason))].join(' / ');
-    L.push(`| **${g.displayName}** | ${cells.join(' | ')} | ${reasons} | ☐该抽 ☐不该抽 |`);
+    L.push(`| **${g.displayName}** | ${cells.join(' | ')} | ${reasons} | ☐该抽 ☐不该抽 | · |`);
   }
   L.push('');
+  L.push('> **裁决列**填 `y` / `n` / `?`；**归因标签列**只对 `n`/`?` 填（`y` 留 `·` 或空）。');
+  L.push('> 归因标签取值见下方「裁决理由」节的枚举表。');
+  L.push('');
 
-  // 裁决理由（人工归因）—— 只在标 n / ? 时需要
+  // 归因标签枚举（参考表）+ 可选补充说明
   L.push('## 裁决理由（人工）');
   L.push('');
-  L.push('> 只对**标 `n` 或 `?`** 的实体需要填（标 `y` 的不用写）。');
-  L.push('> 格式：`- <实体名> | <归因标签>`（可加 `——` 后写补充说明，说明不参与统计）。');
-  L.push('>');
-  L.push('> **归因标签**（固定枚举，选最贴近的一个）：');
-  for (const t of REASON_TAGS) L.push(`> - \`${t.tag}\` — ${t.desc}`);
+  L.push('**主填位置是上表的「归因标签」列**（只对 `n`/`?` 填）。本节用于：(a) 查标签含义；(b) 需要写补充说明时可选补充。');
   L.push('');
-  L.push('<!-- 在下面逐行填写；示例（本段是注释，不会被读取）：');
-  L.push(`- 不可能三角 | 通用概念 —— 是常见决策框架，不是本文专有`);
-  L.push(`- hot.md | 非实体`);
+  L.push('**归因标签枚举**（把左边这个字面量填进上表列里）：');
+  L.push('');
+  L.push('| 标签 | 含义 | 指向的修复 |');
+  L.push('|---|---|---|');
+  for (const t of REASON_TAGS) L.push(`| \`${t.tag}\` | ${t.desc} | ${t.fix} |`);
+  L.push('');
+  L.push('**补充说明（可选）** —— 想对某条写更长的话时填，格式 `- <实体名> —— <说明>`：');
+  L.push('');
+  L.push('<!-- 在下面逐行填写补充说明（本段是注释，不会被读取）：');
+  L.push(`- 不可能三角 —— 是常见决策框架，不是本文专有`);
   L.push('-->');
   L.push('');
 
