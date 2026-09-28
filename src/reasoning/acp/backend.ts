@@ -93,26 +93,24 @@ export class ACPAgentBackend implements ReasoningBackend {
     // ACP 的 session/prompt 无 system 字段：把 system（6 条硬规则 + JSON 格式要求）并入 prompt，
     // 并改发 ContentBlock[]（真实 ACP 要求，opencode 实测）。（F9.2）
     const prompt = buildPrompt(req);
-    // 发 prompt 前清空流式缓冲：session/update 通知不带请求 id，上一次请求的尾部 chunk
-    // 若晚于其响应到达会滞留，被本次 takeStreamedText() 取走 → 回稿拼接畸形
-    // （实测曾致骨架回稿 JSON 在 5268 字节处断裂、触发 CITED_FALLBACK、facts 全丢）。
-    t.connection.resetStreamedText();
+    // 流式正文经 connection.prompt() 原子取回（内含「发前清空缓冲」，防止上一个请求的
+    // 迟到 chunk 混入本次回稿 —— 见 transport.prompt() 的说明）。
     let res: { content?: string; usage?: { inputTokens?: number; outputTokens?: number } };
+    let streamed = '';
     try {
-      res = await t.connection.request<{
-        content?: string;
-        usage?: { inputTokens?: number; outputTokens?: number };
-      }>('session/prompt', {
+      const r = await t.connection.prompt({
         sessionId: this.sessionId,
         prompt: [{ type: 'text', text: prompt }],
       });
+      res = (r.result ?? {}) as { content?: string; usage?: { inputTokens?: number; outputTokens?: number } };
+      streamed = r.text;
     } catch (e) {
       throw toACPRequestError(e);
     }
     const usage = res.usage ?? { inputTokens: 0, outputTokens: 0 };
     // 真实 ACP（opencode）正文经无 id 的 session/update 通知推送，response.content 可能为空；
     // 优先取通知累积正文，回退 response.content（F9.1/F9.2）。
-    const text = (t.connection.takeStreamedText() || res.content || '').trim();
+    const text = (streamed || res.content || '').trim();
     return {
       text,
       blocks: text ? [{ type: 'text', text }] : [],

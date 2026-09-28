@@ -182,6 +182,10 @@ export class AcpConnection {
    * 取走累积的通知正文（取后清空）。
    * 真实 ACP（opencode）的回答经无 id 的 session/update 推送，response 体无 content；
    * 纯补全器后端在 prompt 响应后调用此方法拿正文，取不到时回退 response.content（F9.2）。
+   *
+   * ⚠️ 一次 prompt 的完整生命周期应走 `prompt()`（它把「发前清空 + 响应后取走」
+   * 绑在一起）。单独用本方法会漏掉「发前清空」这一步，导致上一个请求滞留的尾部
+   * chunk 混入本次回稿（见 `prompt()` 的说明）。仅供低层测试/探测使用。
    */
   takeStreamedText(): string {
     const t = this.streamedText;
@@ -190,19 +194,23 @@ export class AcpConnection {
   }
 
   /**
-   * 清空流式正文缓冲（**发 prompt 前**调用，见 backend.complete）。
+   * 发一次 `session/prompt` 并取回其正文 —— 把「发前清空缓冲 + 发请求 + 响应后取正文」
+   * 绑成一个原子步骤，使调用方**无法**遗漏清空这一步。
    *
-   * 为什么需要：`session/update` 通知**不带请求 id**，无法从协议层判断某个 chunk
-   * 属于哪次 prompt。若上一次 prompt 的尾部 chunk 晚于其响应到达，就会滞留在缓冲里，
-   * 被下一次 prompt 的 `takeStreamedText()` 取走 —— 症状是回稿里出现
-   * **上一条回答的尾巴 + 本次完整回答** 的拼接（实测：skeleton 回稿里前 5268 字节
-   * 属上一次、其后是一份完整 JSON，导致 `EXTRACT_PARSE_FAILED` 并触发 CITED_FALLBACK）。
+   * 为什么必须在发前清空：`session/update` 通知**不带请求 id**，无法从协议层判断某个
+   * chunk 属于哪次 prompt。若上一个 prompt 的尾部 chunk 晚于其响应到达，就会滞留在缓冲里，
+   * 被本次取走 —— 症状是回稿里出现**上一条回答的尾巴 + 本次完整回答**的拼接（实测：
+   * skeleton 回稿前 5268 字节属上一次、其后是一份完整 JSON，导致 `EXTRACT_PARSE_FAILED`
+   * 并触发 CITED_FALLBACK，facts 全丢）。
    *
-   * 在发 prompt 前清空，保证每次请求的缓冲从空开始：滞留的旧块被**丢弃**而非拼接。
-   * 这是「宁可丢尾巴，不可污染下一次」的取舍——旧块本就属于已完成的请求，无价值。
+   * 取舍：发前清空意味着遗留的旧块被**丢弃**而非拼接。旧块属于已完成的请求、无价值，
+   * 故「宁可丢尾巴，不可污染下一次」。（并发两条 prompt 在同一连接上仍会串扰——
+   * 无 id 则无从归属，本方法不改变该前提；ACP 腿按串行使用。）
    */
-  resetStreamedText(): void {
+  async prompt(params: unknown, timeoutMs = 0): Promise<{ result: unknown; text: string }> {
     this.streamedText = '';
+    const result = await this.request<unknown>('session/prompt', params, timeoutMs);
+    return { result, text: this.takeStreamedText() };
   }
 
   private failAll(e: Error): void {
