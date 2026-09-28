@@ -1,0 +1,60 @@
+# golden 标注（由 trace-extract-golden.ts 从 compare.md 提取；请勿手改此文件，改 compare.md 再重跑）
+source: raw/我用 WorkBuddy + Obsidian：搭了一套懒人版可进化的AI知识库.md
+annotatedAt: 2026-09-24
+
+# 该存在的实体（规范化名，与 align.ts 归一化一致）
+must_exist:
+  - 个人知识库
+  - 渐进式披露
+  - 双向链接
+  - 向量检索
+  - 叶小钗
+  - 增量编译
+  - 知识编译
+  - 知识查询
+  - 知识摄入
+  - 知识图谱
+  - Agent
+  - Agentic RAG
+  - autoresearch
+  - BM25
+  - Claude Code
+  - 'claude-obsidian'
+  - Codex
+  - Git
+  - IMA
+  - karpathy
+  - LLM wiki
+  - MCP
+  - NotebookLM
+  - Notion
+  - Obsidian
+  - Obsidian Web Clipper
+  - Pi
+  - qmd
+  - RAG
+  - raw层
+  - schema层
+  - wiki层
+  - WorkBuddy
+
+# 明确不该存在的（噪声）
+must_not_exist:
+  - 不可能三角
+  - 人的判断权不能交出去
+  - 向量检索、知识图谱与 LLM Wiki：RAG 被嘲笑了三年，但企业还是离不开它
+  - hot.md
+  - index.md
+
+# 存疑（不参与算分，仅记录）
+unsure:
+  - 健康检查
+
+# 归因标签（键 = 实体名，值 = 标签）—— 标 n/? 的实体应有
+reasons:
+  不可能三角: 其他  # 这感觉不像一个专有的概念，或者说他在不同领域的内容都很不一样
+  健康检查: 通用概念
+  人的判断权不能交出去: 标题误切
+  向量检索、知识图谱与 LLM Wiki：RAG 被嘲笑了三年，但企业还是离不开它: 标题误切
+  hot.md: 非实体
+  index.md: 非实体
