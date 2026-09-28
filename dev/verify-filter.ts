@@ -108,7 +108,8 @@ async function main(): Promise<void> {
 
   console.log('\n> 本验证固定 LLM 输出，结论不受 run-to-run 方差影响。');
   console.log('> 「回稿实体数」= LLM 原始回稿里的实体数（不过滤）；「过滤后保留」= 形态过滤后的实体数。');
-  console.log('> 标 **回稿畸形** 的组合说明该次 LLM 回稿本身不是合法 JSON —— 见下方「已知缺陷」。');
+  console.log('> 标 **回稿畸形** 的组合说明该次 LLM 回稿本身不是合法 JSON —— 这是 cited 路径的既有缺陷，');
+  console.log('> 根因与影响见 docs/evals/report-02-filter-verification.md。');
 }
 
 main().catch((e: unknown) => {

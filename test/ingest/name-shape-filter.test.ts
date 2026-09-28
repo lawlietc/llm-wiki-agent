@@ -80,7 +80,8 @@ describe('工单 01：实体名形态过滤', () => {
       expect(isPlausibleEntityName('WorkBuddy')).toBe(true);
     });
 
-    it('大写文件名式但无扩展名 → 放行（AGENTS.md 是特例，另见下）', () => {
+    it('大写文件名式但无扩展名 → 放行（仅带扩展名才判否）', () => {
+      // `AGENTS` 无扩展名 → 放行；`AGENTS.md` 带扩展名 → 判否（见「应判否」组）
       expect(isPlausibleEntityName('AGENTS')).toBe(true);
     });
   });
@@ -93,6 +94,15 @@ describe('工单 01：实体名形态过滤', () => {
 
     it('句级标点仅出现在长度兜底边界内也判否（标点规则优先）', () => {
       expect(isPlausibleEntityName('短、句')).toBe(false);
+    });
+
+    it('半角 :;? 本身不判否（在代码/盘符里常见，按"有歧义一律放行"约束）', () => {
+      // spec「关键约束」：有歧义一律放行，宁可漏过不可误杀
+      expect(isPlausibleEntityName('C:')).toBe(true);
+      expect(isPlausibleEntityName('A;B')).toBe(true);
+      expect(isPlausibleEntityName('what?')).toBe(true);
+      // 注：URL 仍会被「路径分隔符」规则判否（那是另一条规则，非标点规则）
+      expect(isPlausibleEntityName('http://example.com')).toBe(false);
     });
   });
 });
