@@ -189,6 +189,22 @@ export class AcpConnection {
     return t;
   }
 
+  /**
+   * 清空流式正文缓冲（**发 prompt 前**调用，见 backend.complete）。
+   *
+   * 为什么需要：`session/update` 通知**不带请求 id**，无法从协议层判断某个 chunk
+   * 属于哪次 prompt。若上一次 prompt 的尾部 chunk 晚于其响应到达，就会滞留在缓冲里，
+   * 被下一次 prompt 的 `takeStreamedText()` 取走 —— 症状是回稿里出现
+   * **上一条回答的尾巴 + 本次完整回答** 的拼接（实测：skeleton 回稿里前 5268 字节
+   * 属上一次、其后是一份完整 JSON，导致 `EXTRACT_PARSE_FAILED` 并触发 CITED_FALLBACK）。
+   *
+   * 在发 prompt 前清空，保证每次请求的缓冲从空开始：滞留的旧块被**丢弃**而非拼接。
+   * 这是「宁可丢尾巴，不可污染下一次」的取舍——旧块本就属于已完成的请求，无价值。
+   */
+  resetStreamedText(): void {
+    this.streamedText = '';
+  }
+
   private failAll(e: Error): void {
     for (const [, p] of this.pending) p.reject(e);
     this.pending.clear();

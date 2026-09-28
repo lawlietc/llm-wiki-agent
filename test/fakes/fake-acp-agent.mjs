@@ -1,0 +1,251 @@
+/**
+ * Fake ACP agent —— M7 F7.1 测试替身。
+ *
+ * 一个最小 NDJSON JSON-RPC 服务端，跑在子进程里（被 `ACPAgentBackend` 经
+ * `spawnTransport` 拉起）。它说的协议子集与 `src/reasoning/acp/transport.ts`
+ * 的 `AcpConnection` 完全对称，因此全链路零网络、确定性可测。
+ *
+ * 支持的 JSON-RPC 方法：
+ *   - initialize      → 返回 { protocolVersion, agentCapabilities, agentInfo }
+ *   - session/new     → 返回 { sessionId }
+ *   - session/prompt  → 返回 { content, usage? }
+ *
+ * 剧本经 argv[2] 指向的 JSON 文件控制（避免 Windows 环境变量编码坑）：
+ *   { delayMs, malformed, exitBeforeResponse, exitAfterInit,
+ *     agentCapabilities, usage, sessionError, initError, ignoreTerm, promptText }
+ *
+ * 收到的 initialize 握手参数会按 env.ACP_ECHO_INIT_FILE 回写，供 T7.3-01/02 断言。
+ */
+
+import { readFileSync, writeFileSync } from 'node:fs';
+import { argv, env, stdin, stdout, exit } from 'node:process';
+
+const scriptPath = argv[2];
+let scenario = {};
+try {
+  if (scriptPath) scenario = JSON.parse(readFileSync(scriptPath, 'utf8'));
+} catch {
+  scenario = {};
+}
+
+const {
+  delayMs = 0,
+  malformed = false,
+  exitBeforeResponse = false,
+  exitAfterInit = false,
+  agentCapabilities = { supportsStreaming: false, supportsSessionPersistence: false, supportsToolInvocations: false },
+  usage = { inputTokens: 0, outputTokens: 0 },
+  sessionError = null,
+  initError = null,
+  ignoreTerm = false,
+  promptText = null,
+  omitUsage = false,
+  notifyChunks = null,
+  thoughtChunks = null,
+  omitContent = false,
+  // 响应**之后**才推送的 chunk（模拟真实 ACP 的迟到通知，用于回归 streamedText 跨调用泄漏）
+  lateChunks = null,
+  lateChunksDelayMs = 30,
+} = scenario;
+
+if (ignoreTerm) {
+  // 捕获 SIGTERM 但不退出 —— 用于测试 dispose 的超时强杀分支（I5）。
+  process.on('SIGTERM', () => {});
+}
+
+// 启动标记：写入 env.ACP_STARTED_FILE 表示子进程已拉起（供 T7.4-02 证明未启动）
+if (env.ACP_STARTED_FILE) {
+  try {
+    writeFileSync(env.ACP_STARTED_FILE, '1');
+  } catch {
+    /* 非致命 */
+  }
+}
+
+const echoFile = env.ACP_ECHO_INIT_FILE;
+let sessionSeq = 0;
+let currentSessionId = '';
+let buf = '';
+
+function send(obj) {
+  stdout.write(JSON.stringify(obj) + '\n');
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function handle(msg) {
+  if (delayMs) await sleep(delayMs);
+  const id = msg.id;
+
+  if (msg.method === 'initialize') {
+    // 每次 initialize 调用累加计数（供 T7.4-05 证明 lazy connect 只初始化一次）
+    if (env.ACP_COUNT_FILE) {
+      let n = 0;
+      try {
+        n = Number(readFileSync(env.ACP_COUNT_FILE, 'utf8')) || 0;
+      } catch {
+        n = 0;
+      }
+      try {
+        writeFileSync(env.ACP_COUNT_FILE, String(n + 1));
+      } catch {
+        /* 非致命 */
+      }
+    }
+    if (echoFile) {
+      try {
+        writeFileSync(
+          echoFile,
+          JSON.stringify({
+            protocolVersion: msg.params?.protocolVersion,
+            clientCapabilities: msg.params?.clientCapabilities,
+            clientInfo: msg.params?.clientInfo,
+          }),
+        );
+      } catch {
+        /* 测试环境写入失败不致命 */
+      }
+    }
+    if (initError) {
+      send({ jsonrpc: '2.0', id, error: { code: -32000, message: initError } });
+      return;
+    }
+    if (malformed) {
+      // 畸形行：必须被客户端 warn-and-skip，不中断连接（I4 前置）
+      stdout.write('this is not valid json :::\n');
+    }
+    if (exitBeforeResponse) {
+      // 收到 initialize 但不回包直接退出 —— 触发「子进程提前退出 → 请求拒绝」
+      setTimeout(() => exit(1), 20);
+      return;
+    }
+    send({
+      jsonrpc: '2.0',
+      id,
+      result: {
+        protocolVersion: msg.params?.protocolVersion ?? 1,
+        agentCapabilities,
+        agentInfo: { name: 'fake-acp-agent', version: '0.0.0' },
+      },
+    });
+    if (exitAfterInit) setTimeout(() => exit(0), 30);
+    return;
+  }
+
+  if (msg.method === 'session/new') {
+    // 回显 cwd/mcpServers 供 F9.2 断言真实 ACP 形态
+    if (env.ACP_SESSION_NEW_ECHO_FILE) {
+      try {
+        writeFileSync(env.ACP_SESSION_NEW_ECHO_FILE, JSON.stringify(msg.params ?? {}));
+      } catch {
+        /* 非致命 */
+      }
+    }
+    sessionSeq += 1;
+    currentSessionId = `sess-${sessionSeq}`;
+    send({ jsonrpc: '2.0', id, result: { sessionId: currentSessionId } });
+    return;
+  }
+
+  if (msg.method === 'session/prompt') {
+    // 回显 prompt 形状（ContentBlock[]）供 F9.2 断言
+    if (env.ACP_PROMPT_ECHO_FILE) {
+      try {
+        writeFileSync(env.ACP_PROMPT_ECHO_FILE, JSON.stringify(msg.params?.prompt ?? null));
+      } catch {
+        /* 非致命 */
+      }
+    }
+    if (sessionError) {
+      send({ jsonrpc: '2.0', id, error: { code: -32001, message: sessionError } });
+      return;
+    }
+    const rawPrompt = msg.params?.prompt;
+    // 真实 ACP（F9.2）：prompt 是 ContentBlock[] [{type:'text',text}]；兼容旧字符串形态
+    const promptStr = Array.isArray(rawPrompt)
+      ? rawPrompt.map((b) => (b && b.type === 'text' ? b.text : '')).join('')
+      : typeof rawPrompt === 'string'
+        ? rawPrompt
+        : '';
+    const text = promptText != null ? promptText : `PONG:${promptStr}`;
+
+    // 真实 ACP 形态（opencode 1.18.23 实测）：正文经**无 id** 的 session/update 通知推送，
+    // 响应体只有 { stopReason, usage }。agent_thought_chunk 是思考过程，必须与正文区分。
+    if (thoughtChunks) {
+      for (const t of thoughtChunks) {
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: currentSessionId,
+            update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: t } },
+          },
+        });
+      }
+    }
+    if (notifyChunks) {
+      for (const t of notifyChunks) {
+        send({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: currentSessionId,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: t } },
+          },
+        });
+      }
+    }
+
+    const result = { stopReason: 'end' };
+    if (!omitContent) result.content = text;
+    if (!omitUsage) result.usage = usage;
+    send({ jsonrpc: '2.0', id, result });
+
+    // 响应之后再推一批 chunk（迟到通知）——真实 ACP 下正文块可能晚于响应到达，
+    // 这些块必须**不能**被下一次 prompt 取走（回归：streamedText 跨调用泄漏）。
+    if (lateChunks) {
+      setTimeout(() => {
+        for (const t of lateChunks) {
+          send({
+            jsonrpc: '2.0',
+            method: 'session/update',
+            params: {
+              sessionId: currentSessionId,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: t } },
+            },
+          });
+        }
+      }, lateChunksDelayMs);
+    }
+    return;
+  }
+
+  // 未知方法：回一个 result 占位，不致命
+  send({ jsonrpc: '2.0', id, result: { note: 'unknown-method' } });
+}
+
+stdin.setEncoding('utf8');
+stdin.on('data', (chunk) => {
+  buf += chunk;
+  let nl;
+  while ((nl = buf.indexOf('\n')) >= 0) {
+    const line = buf.slice(0, nl);
+    buf = buf.slice(nl + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      // 客户端发来的畸形行：忽略（服务端同样健壮）
+      continue;
+    }
+    void handle(msg);
+  }
+});
+
+stdin.on('end', () => {
+  // 父进程关闭 stdin：优雅退出
+  exit(0);
+});
